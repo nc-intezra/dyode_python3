@@ -234,6 +234,6 @@ libraries**. Before relying on it, run a real check on your hardware:
 ## Files
 
 `dyode_common.py` and `modbus.py` are shared: the copies in
-`DYODE_v2_light)/in` and `out` must stay identical to the ones in
+`DYODE_v2_light/in` and `out` must stay identical to the ones in
 `DYODE_v1_full`, and `tests/test_layout.py` fails if they drift. Edit the
 v1 copy, then copy it into the other two folders.
