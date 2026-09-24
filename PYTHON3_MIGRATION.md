@@ -55,14 +55,14 @@ DYODE v1 (full), on both boxes:
 
 ```bash
 sudo apt install python3-venv udpcast iproute2
-cd "DYODE v1 (full)"
+cd DYODE_v1_full
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
 # then either run ../dyode_setup.py, or:
 cp config.example.yaml config.yaml    # edit, then copy the same file to both boxes
 ```
 
-DYODE v2 (light): the same, in `DYODE v2 (light)/in` on the input Pi and in
-`DYODE v2 (light)/out` on the output Pi (no udpcast needed). Enable the GPIO
+DYODE v2 (light): the same, in DYODE_v2 (light)/in on the input Pi and in
+DYODE_v2_light/out on the output Pi (no udpcast needed). Enable the GPIO
 UART with `sudo raspi-config` → Interface Options → Serial Port: login shell
 **No**, hardware port **Yes**.
 
@@ -84,8 +84,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-WorkingDirectory=/home/pi/dyode/DYODE v1 (full)
-ExecStart=/home/pi/dyode/DYODE v1 (full)/venv/bin/python dyode_in.py
+WorkingDirectory=/home/pi/dyode/DYODE_v1_full
+ExecStart=/home/pi/dyode/DYODE_v1_full/venv/bin/python dyode_in.py
 Restart=always
 # root is needed for the static ARP entry on the input side,
 # and for serving Modbus on port 502 on the output side.
@@ -234,6 +234,6 @@ libraries**. Before relying on it, run a real check on your hardware:
 ## Files
 
 `dyode_common.py` and `modbus.py` are shared: the copies in
-`DYODE v2 (light)/in` and `out` must stay identical to the ones in
-`DYODE v1 (full)`, and `tests/test_layout.py` fails if they drift. Edit the
+`DYODE_v2_light)/in` and `out` must stay identical to the ones in
+`DYODE_v1_full`, and `tests/test_layout.py` fails if they drift. Edit the
 v1 copy, then copy it into the other two folders.
