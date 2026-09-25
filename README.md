@@ -1,6 +1,6 @@
 # DYODE : Do Your Own Diode
 
-A DIY, low-cost data diode for ICS
+A DIY, low-cost data diode for ICS.
 This project aims at creating a working data diode for a fraction of the price of the commercial ones.
 
 This project includes two versions of DYODE :
