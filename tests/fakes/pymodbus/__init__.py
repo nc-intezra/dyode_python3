@@ -1,2 +1,0 @@
-class ModbusDeviceIdentification:
-    pass
