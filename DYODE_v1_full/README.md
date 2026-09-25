@@ -1,5 +1,5 @@
 # DYODE : Do Your Own DyodE
-A low-cost (~200 €) data diode aimed at Industrial Control Systems.
+Hardware and software to support a low-cost data diode aimed at Industrial Control Systems.
 
 ## Hardware
 We use very standard hardware:
@@ -9,7 +9,7 @@ We use very standard hardware:
 
 
 ## Software
-We use ``udpcast`` to transfer files over a unidirectional channel. Modbsu and screen sharing work over a very simple Python UDP socket implementation.
+We use ``udpcast`` to transfer files over a unidirectional channel. Modbus and screen sharing work over a very simple Python UDP socket implementation.
 
 ## Features
 At the moment, DYODE can be used for the following usages:
