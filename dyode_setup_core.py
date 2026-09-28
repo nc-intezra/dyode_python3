@@ -385,6 +385,9 @@ def systemd_unit_text(variant, side, workdir, python_exe=None):
         "ExecStart=%s %s" % (python_exe, script),
         "Restart=always",
         "RestartSec=5",
+        # Creates /var/log/dyode-transfer with the right mode before start.
+        "LogsDirectory=dyode-transfer",
+        "LogsDirectoryMode=0750",
         "# root is needed for %s." % reason,
         "User=root",
         "",
@@ -478,6 +481,13 @@ def next_steps(plan):
         script = "dyode_in.py" if side == "in" else "dyode_out.py"
         steps.append("Start DYODE:\n    cd %s && sudo venv/bin/python %s --log-level DEBUG"
                      % (_shell_quote(workdir), script))
+    steps.append("Set up log rotation and weekly archiving (logs go to\n"
+                 "/var/log/dyode-transfer; edit the paths in the .service\n"
+                 "first if DYODE is not installed in /opt/dyode):\n"
+                 "    sudo cp packaging/logrotate/dyode-transfer /etc/logrotate.d/\n"
+                 "    sudo cp packaging/systemd/dyode-log-archive.* /etc/systemd/system/\n"
+                 "    sudo systemctl daemon-reload\n"
+                 "    sudo systemctl enable --now dyode-log-archive.timer")
     return steps
 
 

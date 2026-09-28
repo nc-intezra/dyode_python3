@@ -55,14 +55,14 @@ DYODE v1 (full), on both boxes:
 
 ```bash
 sudo apt install python3-venv udpcast iproute2
-cd DYODE_v1_full
+cd "DYODE v1 (full)"
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
 # then either run ../dyode_setup.py, or:
 cp config.example.yaml config.yaml    # edit, then copy the same file to both boxes
 ```
 
-DYODE v2 (light): the same, in DYODE_v2 (light)/in on the input Pi and in
-DYODE_v2_light/out on the output Pi (no udpcast needed). Enable the GPIO
+DYODE v2 (light): the same, in `DYODE v2 (light)/in` on the input Pi and in
+`DYODE v2 (light)/out` on the output Pi (no udpcast needed). Enable the GPIO
 UART with `sudo raspi-config` → Interface Options → Serial Port: login shell
 **No**, hardware port **Yes**.
 
@@ -84,8 +84,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-WorkingDirectory=/home/pi/dyode/DYODE_v1_full
-ExecStart=/home/pi/dyode/DYODE_v1_full/venv/bin/python dyode_in.py
+WorkingDirectory=/home/pi/dyode/DYODE v1 (full)
+ExecStart=/home/pi/dyode/DYODE v1 (full)/venv/bin/python dyode_in.py
 Restart=always
 # root is needed for the static ARP entry on the input side,
 # and for serving Modbus on port 502 on the output side.
@@ -115,11 +115,96 @@ Everything below is optional; defaults match the original behaviour.
 | `settle` | folder module | `2` | seconds a file must be unchanged before it is sent |
 | `bitrate` | folder module | 8 ÷ folder modules | udpcast Mbit/s for this module |
 | `fec` | folder module | `8x16/64` | udpcast FEC ratio, or `none` to disable — see *Throughput tuning* below |
+| `logging.dir` | top level | `/var/log/dyode-transfer` | log directory; empty string for stderr only |
+| `logging.human` | top level | `dyode.log` | human-readable log file name |
+| `logging.json` | top level | `transfer.jsonl` | JSON event log file name |
+| `logging.per_file_events` | top level | `true` | `false` keeps batch summaries only |
 | `http_port`, `http_bind` | screen module | `8080`, `0.0.0.0` | screen-sharing web server |
 | `max_fps` | screen module | `10` | frame rate cap |
 
 Module `type` is now case-insensitive (`Modbus` works), and a typo in the
 config stops start-up with a clear message instead of silently doing nothing.
+
+## Transfer logging
+
+Logs still go to stderr, so `journalctl -u dyode-in -f` is unchanged. On top
+of that, two files are written to `/var/log/dyode-transfer`:
+
+| File | Contents |
+|---|---|
+| `dyode.log` | human-readable, every module, both variants |
+| `transfer.jsonl` | one JSON object per line, folder transfers only |
+
+`transfer.jsonl` is newline-delimited JSON (not a JSON array, which cannot be
+appended to or rotated). Loki, Splunk, Elastic, Vector and fluent-bit all
+ingest it as-is.
+
+```json
+{"v":1,"ts":"2026-09-25T20:32:14.108Z","event":"batch_sent","side":"in","module":"transfer","batch":"9f3c1e2a","files":42,"files_failed":0,"bytes":1073741824,"duration_s":9.41,"mbps":912.4}
+{"v":1,"ts":"2026-09-25T20:32:19.882Z","event":"file_stored","side":"out","module":"transfer","batch":"9f3c1e2a","path":"reports/q3.csv","bytes":81920}
+{"v":1,"ts":"2026-09-25T20:32:20.041Z","event":"file_rejected","side":"out","module":"transfer","batch":"9f3c1e2a","path":"reports/q4.csv","reason":"checksum_mismatch","bytes":81900,"expected_bytes":81920}
+{"v":1,"ts":"2026-09-25T20:32:24.550Z","event":"batch_received","side":"out","module":"transfer","batch":"9f3c1e2a","files":42,"files_stored":41,"files_rejected":1,"files_missing":0,"bytes":1073741824,"duration_s":10.3}
+```
+
+Events: `batch_sent`, `batch_failed`, `file_sent` (input side);
+`manifest_received`, `file_stored`, `file_rejected`, `file_orphaned`,
+`batch_received` (output side).
+
+- `v` is a schema version, so a later change does not silently break parsers.
+- `ts` is ISO-8601 **UTC**. It sorts lexically and has no repeated hour when
+  the clocks go back. The human log stays in local time.
+- `batch` is the same id on both boxes, so sent-vs-received can be joined per
+  batch if both sides' logs ever reach one collector.
+- `mbps` on `batch_sent` gives the throughput trend directly.
+- `per_file_events: false` drops the per-file records and keeps the batch
+  summaries, for when thousands of small files make the volume unhelpful.
+
+**The two sides count different things.** The input box knows what it sent,
+the output box knows what arrived, and on a diode those numbers legitimately
+differ. Neither box can see the other's, and output-side logs cannot come
+back through the diode — collecting them needs an agent on the output
+network.
+
+**`batch_received` has no timeout.** If the last file of a batch is lost, the
+summary does not appear until the next manifest arrives. Alert on a
+`batch_sent` with no matching `batch_received` rather than waiting for one
+that may be late.
+
+### Rotation: logrotate, not Python
+
+Each module runs in its own process (see `supervise()`) and they all append to
+these files. That rules out `TimedRotatingFileHandler`: whichever process
+rotates first renames the file and the others keep writing to the unlinked
+inode, losing lines silently. Instead the daemons use `WatchedFileHandler`,
+which reopens when the inode changes, and `logrotate` does the rotation —
+daily, `rotate 8`, plus `maxsize 100M` so a heavy day cannot fill `/var/log`
+between runs. No `postrotate` signal is needed.
+
+Rotated files are **not** compressed by logrotate. A weekly systemd timer
+packs each week into `archive/dyode-logs-YYYY-Www.tar.gz` instead: consecutive
+days of the same log are highly redundant, and gzip sees that redundancy
+inside one tar stream. Archives are pruned after 26 weeks.
+
+```bash
+sudo cp packaging/logrotate/dyode-transfer /etc/logrotate.d/
+sudo cp packaging/systemd/dyode-log-archive.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dyode-log-archive.timer
+```
+
+Edit `ExecStart` in `dyode-log-archive.service` if DYODE is not in
+`/opt/dyode`. The archiver only ever touches rotated files, never the live
+ones the daemons hold open, so it is safe to run at any time:
+
+```bash
+dyode_logs.py --archive --dry-run     # say what it would do
+dyode_logs.py --stats                 # totals from transfer.jsonl
+```
+
+Files are created `0640 root adm`, so a monitoring agent needs to be in the
+`adm` group to read them. If the log directory cannot be created or written,
+the daemon logs a warning and carries on with stderr only rather than
+refusing to start.
 
 ## Throughput tuning (folder transfers)
 
@@ -234,6 +319,15 @@ libraries**. Before relying on it, run a real check on your hardware:
 ## Files
 
 `dyode_common.py` and `modbus.py` are shared: the copies in
-`DYODE_v2_light/in` and `out` must stay identical to the ones in
-`DYODE_v1_full`, and `tests/test_layout.py` fails if they drift. Edit the
+`DYODE v2 (light)/in` and `out` must stay identical to the ones in
+`DYODE v1 (full)`, and `tests/test_layout.py` fails if they drift. Edit the
 v1 copy, then copy it into the other two folders.
+
+Repository root:
+
+| Path | Purpose |
+|---|---|
+| `dyode_setup.py`, `dyode_setup_core.py` | guided setup wizard |
+| `dyode_logs.py` | weekly log archiving (`--archive`) and a reader (`--stats`) |
+| `packaging/logrotate/dyode-transfer` | install as `/etc/logrotate.d/dyode-transfer` |
+| `packaging/systemd/dyode-log-archive.{service,timer}` | weekly archiving timer |
