@@ -30,7 +30,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_original_v2_configs_still_load(self):
         for side in ("in", "out"):
-            cfg = common.load_config(os.path.join(_setup.REPO, "DYODE v2 (light)",
+            cfg = common.load_config(os.path.join(_setup.REPO, "DYODE_v2_light",
                                                   side, "config.yaml"))
             self.assertEqual(cfg["serial"]["device"], "/dev/serial0")
             self.assertEqual(cfg["network"]["out_ip"], "10.0.1.2")   # defaults

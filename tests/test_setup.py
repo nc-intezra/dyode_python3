@@ -193,8 +193,8 @@ class ConfigModelTests(unittest.TestCase):
             self.assertEqual(fh.read(), "second\n")
 
     def test_systemd_unit(self):
-        unit = core.systemd_unit_text("v1", "out", "/opt/dyode/DYODE v1 (full)")
-        self.assertIn("ExecStart=/opt/dyode/DYODE v1 (full)/venv/bin/python dyode_out.py", unit)
+        unit = core.systemd_unit_text("v1", "out", "/opt/dyode/DYODE_v1_full")
+        self.assertIn("ExecStart=/opt/dyode/DYODE_v1_full/venv/bin/python dyode_out.py", unit)
         self.assertIn("Restart=always", unit)
         self.assertIn("port 502", unit)
 
@@ -202,7 +202,7 @@ class ConfigModelTests(unittest.TestCase):
 class WizardFlowTests(unittest.TestCase):
     def setUp(self):
         self.repo = tempfile.mkdtemp()
-        for sub in ("DYODE v1 (full)", "DYODE v2 (light)/in", "DYODE v2 (light)/out"):
+        for sub in ("DYODE_v1_full", "DYODE_v2_light/in", "DYODE_v2_light/out"):
             os.makedirs(os.path.join(self.repo, sub))
         self.net = fake_sysfs({"eth0": ("b8:27:eb:00:00:01", True, False),
                                "eth1": ("b8:27:eb:00:00:02", False, False)})
@@ -227,12 +227,12 @@ class WizardFlowTests(unittest.TestCase):
         self.assertEqual(plan.model.out_mac, "")                   # left for later
         self.assertTrue(plan.write_unit)
         self.assertEqual(plan.config_path,
-                         os.path.join(self.repo, "DYODE v1 (full)", "config.yaml"))
+                         os.path.join(self.repo, "DYODE_v1_full", "config.yaml"))
         self.assertTrue(wizard.review_and_apply(ScriptedUi([("confirm", True)]), plan))
         cfg = common.load_config(plan.config_path)
         self.assertEqual(cfg["modules"]["PLC one"]["registers"], [(0, 100)])
         self.assertTrue(os.path.exists(os.path.join(
-            self.repo, "DYODE v1 (full)", "dyode-in.service")))
+            self.repo, "DYODE_v1_full", "dyode-in.service")))
 
     def test_second_box_imports_first_box_config(self):
         _, first = self.run_wizard([
@@ -269,7 +269,7 @@ class WizardFlowTests(unittest.TestCase):
             ("text", "192.168.0.5"), ("text", "1502"), ("text", "0-105"), ("text", "0-1"),
             ("choose", "Done"), ("confirm", False)], args)
         self.assertEqual(plan.workdir,
-                         os.path.join(self.repo, "DYODE v2 (light)", "out"))
+                         os.path.join(self.repo, "DYODE_v2_light", "out"))
         self.assertEqual(plan.model.serial_baud, 115200)
         self.assertTrue(wizard.review_and_apply(ScriptedUi([("confirm", True)]), plan))
         self.assertEqual(common.load_config(plan.config_path)["serial"]["baudrate"], 115200)
@@ -306,11 +306,11 @@ class FrontEndTests(unittest.TestCase):
 
     def setUp(self):
         self.repo = tempfile.mkdtemp()
-        for sub in ("DYODE v1 (full)", "DYODE v2 (light)/in", "DYODE v2 (light)/out"):
+        for sub in ("DYODE_v1_full", "DYODE_v2_light/in", "DYODE_v2_light/out"):
             os.makedirs(os.path.join(self.repo, sub))
         self.net = fake_sysfs({"eth0": ("b8:27:eb:00:00:01", True, False)})
         shutil.copy(os.path.join(_setup.V1, "dyode_common.py"),
-                    os.path.join(self.repo, "DYODE v1 (full)"))
+                    os.path.join(self.repo, "DYODE_v1_full"))
 
     def run_plain(self, answers, extra=()):
         cmd = [sys.executable, os.path.join(_setup.REPO, "dyode_setup.py"), "--plain",
@@ -336,7 +336,7 @@ class FrontEndTests(unittest.TestCase):
     def test_plain_mode_writes_a_valid_config(self):
         res = self.run_plain(self.ANSWERS)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        path = os.path.join(self.repo, "DYODE v1 (full)", "config.yaml")
+        path = os.path.join(self.repo, "DYODE_v1_full", "config.yaml")
         cfg = common.load_config(path)
         self.assertEqual(cfg["network"]["in_mac"] if "in_mac" in cfg["network"]
                          else cfg["network"]["out_mac"], "b8:27:eb:ff:ff:ff")
@@ -347,7 +347,7 @@ class FrontEndTests(unittest.TestCase):
     def test_dry_run_writes_nothing(self):
         res = self.run_plain(self.ANSWERS, extra=["--dry-run"])
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertFalse(os.path.exists(os.path.join(self.repo, "DYODE v1 (full)",
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "DYODE_v1_full",
                                                      "config.yaml")))
 
     def test_invalid_input_is_rejected_then_accepted(self):
@@ -386,7 +386,7 @@ class FrontEndTests(unittest.TestCase):
         finally:
             os.close(fd)
             os.waitpid(pid, 0)
-        self.assertFalse(os.path.exists(os.path.join(self.repo, "DYODE v1 (full)",
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "DYODE_v1_full",
                                                      "config.yaml")))
 
 

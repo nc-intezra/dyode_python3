@@ -14,8 +14,8 @@ import sys
 import time
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-V1_DIR = os.path.join(REPO_ROOT, "DYODE v1 (full)")
-V2_DIR = os.path.join(REPO_ROOT, "DYODE v2 (light)")
+V1_DIR = os.path.join(REPO_ROOT, "DYODE_v1_full")
+V2_DIR = os.path.join(REPO_ROOT, "DYODE_v2_light")
 
 # Import the runtime's own config loader so a generated file is validated by
 # exactly the code that will later read it.
@@ -365,8 +365,8 @@ def side_word(side):
 
 def target_dir(variant, side, repo_root=REPO_ROOT):
     if variant == "v1":
-        return os.path.join(repo_root, "DYODE v1 (full)")
-    return os.path.join(repo_root, "DYODE v2 (light)", "in" if side == "in" else "out")
+        return os.path.join(repo_root, "DYODE_v1_full")
+    return os.path.join(repo_root, "DYODE_v2_light", "in" if side == "in" else "out")
 
 
 def systemd_unit_text(variant, side, workdir, python_exe=None):
