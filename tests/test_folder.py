@@ -122,12 +122,64 @@ class FolderTransferTests(unittest.TestCase):
             self.assertEqual(dyode.send_batch(dyode.scan_ready_files(self.inp, 2)[0],
                                               self.cast, self.work), 1)
         self.cast.fail_on = None
-        with self.assertLogs("dyode.folder", "WARNING") as logs:
-            _, _, results = self.transfer()
+        _, _, results = self.transfer()
         self.assertEqual(results, ["manifest", "stored", "manifest", "stored", "stored"])
-        self.assertIn("interrupted", "\n".join(logs.output))
         for n in "abc":
             self.assertEqual(self.read_out(n + ".txt"), n.encode() * 10)
+        # The re-sent files supersede the first batch's outstanding entries,
+        # so nothing is left open to be reported missing later.
+        self.assertEqual(self.rx.pending, [])
+
+    def test_one_lost_file_does_not_destroy_the_rest_of_the_batch(self):
+        """Regression: identity used to come from arrival order.
+
+        A single dropped transfer shifted every later file by one, so each
+        was checked against the previous file's hash and the whole tail of
+        the batch was discarded.  Files are matched by content now.
+        """
+        names = ["f%02d.txt" % i for i in range(8)]
+        for i, name in enumerate(names):
+            make_file(self.inp, name, b"payload-%02d" % i)
+        dyode.send_batch(dyode.scan_ready_files(self.inp, 2)[0], self.cast,
+                         self.work)
+        del self.cast.queue[3]                # lose one transfer outright
+        results = self.cast.deliver_all(self.rx, self.staging)
+
+        self.assertEqual(results.count("stored"), 7)
+        lost = names[2]
+        for i, name in enumerate(names):
+            if name == lost:
+                self.assertFalse(os.path.exists(os.path.join(self.out, name)))
+            else:
+                self.assertEqual(self.read_out(name), b"payload-%02d" % i)
+
+    def test_duplicate_content_in_one_batch_lands_under_both_names(self):
+        make_file(self.inp, "one.txt", b"same bytes")
+        make_file(self.inp, "two.txt", b"same bytes")
+        make_file(self.inp, "three.txt", b"other")
+        sent, _, _ = self.transfer()
+        self.assertEqual(sent, 3)
+        self.assertEqual(self.read_out("one.txt"), b"same bytes")
+        self.assertEqual(self.read_out("two.txt"), b"same bytes")
+        self.assertEqual(self.read_out("three.txt"), b"other")
+
+    def test_damaged_transfer_is_discarded_and_named_as_missing(self):
+        make_file(self.inp, "a.txt", b"aaaa")
+        make_file(self.inp, "b.txt", b"bbbb")
+        dyode.send_batch(dyode.scan_ready_files(self.inp, 2)[0], self.cast,
+                         self.work)
+        self.cast.queue[1] = b"XX"            # a.txt damaged in flight
+        with self.assertLogs("dyode.folder", "ERROR"):
+            self.cast.deliver_all(self.rx, self.staging)
+        self.assertEqual(self.read_out("b.txt"), b"bbbb")
+        self.assertFalse(os.path.exists(os.path.join(self.out, "a.txt")))
+        # a.txt is still outstanding; the sweep names it rather than
+        # silently blaming whichever blob arrived next.
+        self.assertEqual([e["path"] for e in self.rx.pending], ["a.txt"])
+        time.sleep(0.02)
+        with self.assertLogs("dyode.folder", "WARNING") as logs:
+            self.rx.sweep(batch_timeout=0.001)
+        self.assertIn("a.txt never arrived", "\n".join(logs.output))
 
     def test_file_without_manifest_is_discarded(self):
         blob = make_file(self.staging, "x", b"stray")
@@ -162,6 +214,73 @@ class UdpCastCommandTests(unittest.TestCase):
         recv = cast.receiver_cmd("/out/f")
         self.assertEqual(recv[recv.index("--interface") + 1], "enxBB")
         self.assertEqual(recv[recv.index("--mcast-rdv-addr") + 1], "10.9.0.1")
+
+
+class SentFileRetentionTests(unittest.TestCase):
+    """udp-sender exiting 0 is not proof of delivery, so a sent file is
+    retired rather than unlinked and can be re-sent by hand."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="dyode_sent_")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def test_sent_file_is_moved_under_dyode_sent(self):
+        path = make_file(self.root, "sub/report.csv", b"data")
+        dyode.retire_sent_file(self.root, "sub/report.csv", path,
+                               keep_sent_hours=24)
+        self.assertFalse(os.path.exists(path))
+        kept = os.path.join(self.root, dyode.SENT_DIR, "sub", "report.csv")
+        self.assertTrue(os.path.isfile(kept))
+
+    def test_retired_files_are_not_picked_up_again(self):
+        path = make_file(self.root, "a.txt", b"data")
+        dyode.retire_sent_file(self.root, "a.txt", path, keep_sent_hours=24)
+        ready, _ = dyode.scan_ready_files(self.root, settle=0)
+        self.assertEqual(ready, [])
+
+    def test_zero_hours_deletes_as_before(self):
+        path = make_file(self.root, "a.txt", b"data")
+        dyode.retire_sent_file(self.root, "a.txt", path, keep_sent_hours=0)
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.isdir(os.path.join(self.root, dyode.SENT_DIR)))
+
+    def test_prune_removes_only_files_past_the_window(self):
+        old = make_file(self.root, "old.txt", b"o")
+        new = make_file(self.root, "new.txt", b"n")
+        dyode.retire_sent_file(self.root, "old.txt", old, keep_sent_hours=24)
+        dyode.retire_sent_file(self.root, "new.txt", new, keep_sent_hours=24)
+        kept = os.path.join(self.root, dyode.SENT_DIR)
+        stale = time.time() - 48 * 3600
+        os.utime(os.path.join(kept, "old.txt"), (stale, stale))
+        dyode.prune_sent(self.root, keep_sent_hours=24)
+        self.assertFalse(os.path.exists(os.path.join(kept, "old.txt")))
+        self.assertTrue(os.path.exists(os.path.join(kept, "new.txt")))
+
+
+class StagingLocationTests(unittest.TestCase):
+    """Staging must be outside the output folder: NFS, SFTP and rsync all
+    walk it, and udp-receiver writes there for the whole transfer."""
+
+    def test_default_is_a_sibling_of_the_output_folder(self):
+        staging = dyode.staging_dir({"out": "/srv/dyode/out"})
+        self.assertEqual(staging, "/srv/dyode/out.incoming")
+        self.assertNotEqual(
+            os.path.commonpath([staging, "/srv/dyode/out"]), "/srv/dyode/out")
+
+    def test_trailing_separator_does_not_nest_it(self):
+        self.assertEqual(dyode.staging_dir({"out": "/srv/out/"}),
+                         "/srv/out.incoming")
+
+    def test_explicit_staging_is_used(self):
+        self.assertEqual(
+            dyode.staging_dir({"out": "/srv/out", "staging": "/var/tmp/in"}),
+            "/var/tmp/in")
+
+    def test_config_rejects_staging_inside_the_output_folder(self):
+        with self.assertRaises(common.ConfigError):
+            common._normalize_module("m", {
+                "type": "folder", "port": 9600, "in": "/srv/in",
+                "out": "/srv/out", "staging": "/srv/out/.incoming"})
 
 
 class FecOptionTests(unittest.TestCase):

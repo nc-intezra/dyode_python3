@@ -30,6 +30,25 @@ modules:
     out: /home/pi/out
     # optional: settle: 2       seconds a file must be unchanged before sending
     # optional: bitrate: 4      Mbit/s; default = 8 shared across folder modules
+    # optional: file_gap: 0.5   seconds to pause between files, so the output
+    #                           box can restart udp-receiver.  A diode gives
+    #                           it no way to ask, so this is the only way it
+    #                           gets one.  Raise it if files go missing.
+    # optional: keep_sent_hours: 24
+    #                           sent files are moved to .dyode_sent and kept
+    #                           this long instead of being deleted, because
+    #                           udp-sender exiting 0 is not proof of delivery.
+    #                           Copy one back here to re-send it.  0 = delete.
+    # optional: staging: /srv/dyode-incoming
+    #                           where incoming transfers are written before
+    #                           verification.  Default is <out>.incoming.
+    #                           It MUST NOT be inside 'out', or NFS/SFTP/rsync
+    #                           serving that folder will hand out partial
+    #                           files.  Keep it on the same filesystem as
+    #                           'out' so the final move stays atomic.
+    # optional: batch_timeout: 300
+    #                           seconds before an incomplete batch is closed
+    #                           and its missing files named in the log.
     # optional: fec: 8x8/128    forward error correction ratio (default 8x16/64)
     #                           or 'none' to switch it off.  The FEC encoder is
     #                           single-threaded and caps throughput well below

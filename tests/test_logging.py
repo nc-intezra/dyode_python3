@@ -337,17 +337,26 @@ class TransferEventTests(unittest.TestCase):
         cast.queue[2] = b"h" * 39
         cast.deliver_all(receiver, self.stage)
 
+        # A damaged blob cannot be attributed to a file any more -- that
+        # guess is exactly what used to corrupt the rest of the batch.  It
+        # is logged by size, and the file it was meant to be is named when
+        # the batch closes.
         rejected = [e for e in read_events(self.logs)
                     if e["event"] == "file_rejected"]
         self.assertEqual(len(rejected), 1)
-        self.assertEqual(rejected[0]["path"], "bad.txt")
-        self.assertEqual(rejected[0]["reason"], "checksum_mismatch")
+        self.assertEqual(rejected[0]["reason"], "no_matching_file")
         self.assertEqual(rejected[0]["bytes"], 39)
-        self.assertEqual(rejected[0]["expected_bytes"], 40)
+        self.assertNotIn("path", rejected[0])
+
+        receiver.sweep(batch_timeout=0.0001)
+        missing = [e for e in read_events(self.logs)
+                   if e["event"] == "file_missing"]
+        self.assertEqual([e["path"] for e in missing], ["bad.txt"])
         summary = [e for e in read_events(self.logs)
                    if e["event"] == "batch_received"][0]
         self.assertEqual(summary["files_stored"], 1)
-        self.assertEqual(summary["files_rejected"], 1)
+        self.assertEqual(summary["files_missing"], 1)
+        self.assertEqual(summary["reason"], "timeout")
 
     def test_an_interrupted_batch_reports_the_missing_files(self):
         import test_folder
@@ -368,7 +377,9 @@ class TransferEventTests(unittest.TestCase):
             receiver.handle(blob)
         cast.queue.clear()
 
-        # A new batch arrives; the old one must be summarized as incomplete.
+        # A new batch for a DIFFERENT file arrives. The incomplete batch is
+        # kept open rather than written off, so that a late y.txt would
+        # still be stored; the sweep is what finally reports it.
         self.use_side("in")
         second = self.make_files([("z.txt", b"z" * 10)])
         dyode.send_batch(second, cast, self.work, module="transfer")
@@ -377,10 +388,19 @@ class TransferEventTests(unittest.TestCase):
 
         summaries = [e for e in read_events(self.logs)
                      if e["event"] == "batch_received"]
+        self.assertEqual(len(summaries), 1)             # only z.txt's batch
+        self.assertEqual(summaries[0]["files_missing"], 0)
+        self.assertEqual([e["path"] for e in receiver.pending], ["y.txt"])
+
+        receiver.sweep(batch_timeout=0.0001)
+        summaries = [e for e in read_events(self.logs)
+                     if e["event"] == "batch_received"]
         self.assertEqual(len(summaries), 2)
-        self.assertEqual(summaries[0]["files_missing"], 1)
-        self.assertEqual(summaries[0]["files_stored"], 1)
-        self.assertEqual(summaries[1]["files_missing"], 0)
+        self.assertEqual(summaries[1]["files_missing"], 1)
+        self.assertEqual(summaries[1]["files_stored"], 1)
+        missing = [e["path"] for e in read_events(self.logs)
+                   if e["event"] == "file_missing"]
+        self.assertEqual(missing, ["y.txt"])
 
 
 if __name__ == "__main__":

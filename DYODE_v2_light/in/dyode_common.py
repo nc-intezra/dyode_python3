@@ -338,6 +338,34 @@ def _normalize_module(name, props):
                     raise ConfigError("module %r: 'bitrate' must be at least 1"
                                       % name)
             props["fec"] = _normalize_fec(name, props.get("fec", DEFAULT_FEC))
+            # Pause between files: the receiver must restart udp-receiver
+            # between transfers and a diode gives it no way to say so.
+            props["file_gap"] = _positive_number(
+                name, "file_gap", props.get("file_gap", 0.5), allow_zero=True)
+            # Sent files are retired under .dyode_sent rather than deleted,
+            # because udp-sender exiting 0 is not proof of delivery.
+            props["keep_sent_hours"] = _positive_number(
+                name, "keep_sent_hours", props.get("keep_sent_hours", 24),
+                allow_zero=True, integer=True)
+            # How long an incomplete batch stays open before it is closed
+            # and its missing files reported.
+            props["batch_timeout"] = _positive_number(
+                name, "batch_timeout", props.get("batch_timeout", 300.0),
+                allow_zero=True)
+            if props.get("staging") is not None:
+                staging = str(props["staging"]).strip()
+                if not os.path.isabs(staging):
+                    raise ConfigError("module %r: 'staging' must be an "
+                                      "absolute path, got %r"
+                                      % (name, props["staging"]))
+                out_abs = os.path.abspath(str(props["out"]))
+                if os.path.commonpath([os.path.abspath(staging), out_abs]) \
+                        == out_abs:
+                    raise ConfigError(
+                        "module %r: 'staging' must not be inside the output "
+                        "folder, or anything serving that folder will see "
+                        "partial files" % name)
+                props["staging"] = staging
     elif mtype == "modbus":
         if "ip" not in props:
             raise ConfigError("module %r: PLC 'ip' is required" % name)
@@ -349,6 +377,20 @@ def _normalize_module(name, props):
         if not props["registers"] and not props["coils"]:
             raise ConfigError("module %r: no registers or coils configured" % name)
     return props
+
+
+def _positive_number(name, key, value, allow_zero=False, integer=False):
+    try:
+        number = int(value) if integer else float(value)
+    except (TypeError, ValueError):
+        raise ConfigError("module %r: %r must be a number, got %r"
+                          % (name, key, value))
+    if number < 0 or (number == 0 and not allow_zero):
+        raise ConfigError("module %r: %r must be %s, got %r"
+                          % (name, key,
+                             "zero or more" if allow_zero else "more than zero",
+                             value))
+    return number
 
 
 def _normalize_fec(name, value):

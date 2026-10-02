@@ -113,6 +113,10 @@ Everything below is optional; defaults match the original behaviour.
 | `stale_after` | modbus module | `10` | warn on the output side after this many seconds without updates |
 | `bind_out` | modbus module | `0.0.0.0` | address the output Modbus server listens on |
 | `settle` | folder module | `2` | seconds a file must be unchanged before it is sent |
+| `file_gap` | folder module | `0.5` | seconds between files, so the receiver can restart `udp-receiver` |
+| `keep_sent_hours` | folder module | `24` | how long sent files are kept under `.dyode_sent`; `0` deletes them |
+| `staging` | folder module | `<out>.incoming` | where transfers land before verification; must be outside `out` |
+| `batch_timeout` | folder module | `300` | seconds before an incomplete batch is closed and its missing files named |
 | `bitrate` | folder module | 8 ÷ folder modules | udpcast Mbit/s for this module |
 | `fec` | folder module | `8x16/64` | udpcast FEC ratio, or `none` to disable — see *Throughput tuning* below |
 | `logging.dir` | top level | `/var/log/dyode-transfer` | log directory; empty string for stderr only |
@@ -124,6 +128,67 @@ Everything below is optional; defaults match the original behaviour.
 
 Module `type` is now case-insensitive (`Modbus` works), and a typo in the
 config stops start-up with a clear message instead of silently doing nothing.
+
+## Folder transfers: how a file is identified (changed)
+
+**If you ran an earlier version of this port, upgrade the output box.** The
+first version matched received files to manifest entries *by arrival order*:
+the Nth transfer was assumed to be the Nth manifest entry. One lost transfer
+shifted every later file by one, so each was checked against the previous
+file's hash and the whole tail of the batch was discarded. Measured on a
+20-file batch, a single dropped transfer cost 17 files:
+
+```
+file_stored    f00.bin    got=10000
+file_stored    f01.bin    got=11994
+file_stored    f02.bin    got=13988
+file_rejected  f03.bin    got=17976   expected=15982     <- f03 never arrived
+file_rejected  f04.bin    got=19970   expected=17976     <- everything shifts
+```
+
+Files are now matched **by content**: the receiver hashes the blob (which it
+did anyway) and looks that hash up among the entries it is waiting for. A
+lost transfer now costs exactly that one file. The wire format did not
+change, so the input box needs no coordinated upgrade for this.
+
+Consequences worth knowing:
+
+- A damaged transfer can no longer be attributed to a file, so
+  `file_rejected` carries `reason: no_matching_file` and a size rather than a
+  path. The file that never arrived is named instead when its batch closes,
+  as a `file_missing` event — which is more accurate, since the old message
+  usually blamed the wrong file.
+- Several recent batches stay open at once (four), so a lost manifest or two
+  overlapping batches cannot cascade either. A re-sent path supersedes the
+  older batch's outstanding entry, so nothing is reported missing twice.
+- An incomplete batch is closed after `batch_timeout` and its missing files
+  listed, rather than waiting for later manifests to push it out.
+
+### Three related fixes
+
+**The receiver no longer goes deaf between files.** It used to hash and move
+each file before re-opening the socket. A diode has no flow control, so at
+line rate the sender had already pushed hundreds of megabytes of the next
+file into a closed socket. Verification now runs in a worker thread and
+`udp-receiver` restarts immediately. The sender also pauses `file_gap`
+seconds between files, because there is no handshake to wait on — raise it
+if files still go missing.
+
+**Sent files are retired, not deleted.** `udp-sender` exiting 0 means
+"transmitted", not "delivered". Files now move to `.dyode_sent/` under the
+watched folder and are pruned after `keep_sent_hours`. To re-send one, copy
+it back into the watched folder. `scan_ready_files` skips `.dyode*`, so it is
+not picked up again on its own.
+
+**Staging moved out of the output folder.** `udp-receiver` writes the
+incoming file for the whole duration of the transfer, and the old staging
+directory was `<out>/.dyode_incoming`. The dot prefix hides it from `ls` but
+not from NFS, SFTP, rsync, `find`, an indexer or an AV scanner — anything
+serving the output folder could hand out a growing, unverified partial. At
+900 Mbit/s a 10 GB file was exposed that way for about 90 seconds. Staging
+now defaults to `<out>.incoming`, a sibling on the same filesystem so the
+final `os.replace` stays atomic, and the config refuses a `staging` path
+inside `out`.
 
 ## Transfer logging
 
@@ -147,8 +212,13 @@ ingest it as-is.
 ```
 
 Events: `batch_sent`, `batch_failed`, `file_sent` (input side);
-`manifest_received`, `file_stored`, `file_rejected`, `file_orphaned`,
-`batch_received` (output side).
+`manifest_received`, `file_stored`, `file_rejected`, `file_missing`,
+`file_orphaned`, `batch_received` (output side). `batch_received` carries a
+`reason` of `complete`, `timeout`, `superseded`, `evicted` or `shutdown`.
+
+The alert that matters most: **`file_missing`**. It names a file the
+manifest promised that never arrived, which on a diode is the failure mode
+you cannot otherwise detect.
 
 - `v` is a schema version, so a later change does not silently break parsers.
 - `ts` is ISO-8601 **UTC**. It sorts lexically and has no repeated hour when

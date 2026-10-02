@@ -13,13 +13,16 @@ it arrives in place of an expected file, and resynchronizes on it instead
 of discarding everything that follows.
 """
 
+import collections
 import hashlib
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 
@@ -189,8 +192,64 @@ def build_manifest(files):
     return {"magic": MANIFEST_MAGIC, "batch": uuid.uuid4().hex, "files": entries}
 
 
-def send_batch(files, transport, workdir, module=None):
-    """Send one batch. Returns the number of files sent (and deleted)."""
+SENT_DIR = ".dyode_sent"
+
+
+def retire_sent_file(root, rel, path, keep_sent_hours):
+    """Move a file out of the watched folder once it has been transmitted.
+
+    The original unlinked it as soon as udp-sender exited 0, but on a diode
+    that exit code only means "transmitted" -- there is no acknowledgement,
+    so a file lost in flight was gone for good.  Keeping it under
+    .dyode_sent for a while makes a failed transfer recoverable: copy it
+    back into the watched folder and it is sent again.  scan_ready_files
+    skips folders starting with '.dyode', so it is not picked up again.
+    """
+    if not keep_sent_hours or root is None:
+        try:
+            os.remove(path)
+        except OSError as err:
+            log.error("sent %s but could not delete it: %s", rel, err)
+        return
+    dest = os.path.join(root, SENT_DIR, rel)
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        os.replace(path, dest)
+    except OSError as err:
+        log.error("sent %s but could not retire it to %s: %s",
+                  rel, SENT_DIR, err)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def prune_sent(root, keep_sent_hours):
+    """Delete retired files older than keep_sent_hours."""
+    if not keep_sent_hours:
+        return
+    base = os.path.join(root, SENT_DIR)
+    if not os.path.isdir(base):
+        return
+    cutoff = time.time() - keep_sent_hours * 3600
+    for dirpath, _dirnames, filenames in os.walk(base, topdown=False):
+        for fname in filenames:
+            path = os.path.join(dirpath, fname)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+        if dirpath != base:
+            try:
+                os.rmdir(dirpath)             # only succeeds when empty
+            except OSError:
+                pass
+
+
+def send_batch(files, transport, workdir, module=None, root=None,
+               file_gap=0.0, keep_sent_hours=24):
+    """Send one batch. Returns the number of files sent."""
     manifest = build_manifest(files)
     batch = manifest["batch"]
     manifest_path = os.path.join(workdir, "manifest_%s.json" % batch)
@@ -215,14 +274,15 @@ def send_batch(files, transport, workdir, module=None):
             log.error("aborting batch; %d file(s) left for the next batch",
                       len(files) - sent)
             break
-        try:
-            os.remove(path)
-        except OSError as err:
-            log.error("sent %s but could not delete it: %s", rel, err)
+        retire_sent_file(root, rel, path, keep_sent_hours)
         sent += 1
         sent_bytes += entry["size"]
         common.log_event("file_sent", module=module, per_file=True,
                          batch=batch[:8], path=rel, bytes=entry["size"])
+        # The receiver needs a moment to restart udp-receiver between
+        # transfers, and a diode gives it no way to ask for one.
+        if file_gap:
+            time.sleep(file_gap)
 
     elapsed = time.monotonic() - started
     common.log_event("batch_sent", module=module, batch=batch[:8],
@@ -240,20 +300,25 @@ def run_folder_input(name, props, cfg):
     os.makedirs(root, exist_ok=True)
     settle = float(props.get("settle", 2.0))
     rescan = float(props.get("rescan", 30.0))
+    file_gap = float(props.get("file_gap", 0.5))
+    keep_sent_hours = props.get("keep_sent_hours", 24)
     transport = UdpCast(props, cfg)
     watcher = ChangeWatcher(root)
     workdir = tempfile.mkdtemp(prefix="dyode_%s_" % props["port"])
-    log.info("module %r: watching %s (port %d, %d Mbit/s, FEC %s)",
-             name, root, props["port"], transport.bitrate,
-             transport.fec or "off")
+    log.info("module %r: watching %s (port %d, %d Mbit/s, FEC %s, gap %.2fs, "
+             "sent files kept %s)", name, root, props["port"],
+             transport.bitrate, transport.fec or "off", file_gap,
+             ("%dh" % keep_sent_hours) if keep_sent_hours else "not at all")
     try:
         while True:
             # Existing files are picked up at start-up too (the original
             # only noticed them once a new file arrived).
             ready, waiting = scan_ready_files(root, settle)
             if ready:
-                send_batch(ready, transport, workdir, module=name)
+                send_batch(ready, transport, workdir, module=name, root=root,
+                           file_gap=file_gap, keep_sent_hours=keep_sent_hours)
                 continue
+            prune_sent(root, keep_sent_hours)
             watcher.wait(settle if waiting else rescan)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -304,121 +369,295 @@ def read_manifest(path):
     return data
 
 
+class _Batch:
+    """One manifest's worth of files still waiting to arrive."""
+
+    def __init__(self, manifest):
+        self.id = manifest.get("batch") or "?"
+        self.started = time.monotonic()
+        self.last_activity = self.started
+        self.expected = len(manifest["files"])
+        self.stored = 0
+        self.rejected = 0
+        self.bytes = 0
+        # sha256 -> entries still outstanding.  A list, because two files
+        # in one batch may legitimately have identical content.
+        self.by_hash = {}
+        self.sizes = set()
+        self.paths = set()
+        for entry in manifest["files"]:
+            self.by_hash.setdefault(entry["sha256"], []).append(entry)
+            self.sizes.add(entry["size"])
+            self.paths.add(entry["path"])
+
+    def drop_path(self, path):
+        """Forget an outstanding entry because a newer batch supersedes it."""
+        if path not in self.paths:
+            return False
+        dropped = False
+        for digest, entries in list(self.by_hash.items()):
+            keep = [e for e in entries if e["path"] != path]
+            if len(keep) != len(entries):
+                dropped = True
+                if keep:
+                    self.by_hash[digest] = keep
+                else:
+                    del self.by_hash[digest]
+        self.paths.discard(path)
+        return dropped
+
+    @property
+    def outstanding(self):
+        return sum(len(v) for v in self.by_hash.values())
+
+    def take(self, digest):
+        """Claim an entry matching this content, or None."""
+        entries = self.by_hash.get(digest)
+        if not entries:
+            return None
+        entry = entries.pop(0)
+        if not entries:
+            del self.by_hash[digest]
+        return entry
+
+
 class FolderReceiver:
-    """Output-side state machine. Feed it each received file with handle()."""
+    """Output-side state machine. Feed it each received file with handle().
+
+    Files are matched to manifest entries BY CONTENT, not by arrival order.
+    The earlier version popped the next manifest entry for each blob, which
+    meant one lost transfer shifted every later file by one and destroyed
+    the rest of the batch.  Here the blob's own SHA-256 says which file it
+    is, so a lost transfer costs exactly that file.  The hash is computed
+    either way, so this is free.
+
+    Several recent batches are kept open at once, so a lost manifest or two
+    overlapping batches cannot cascade either.
+    """
+
+    RETAIN_BATCHES = 4
 
     def __init__(self, out_dir, module=None):
         self.out_dir = out_dir
         self.module = module
-        self.pending = []
-        self.batch = None
-        self._reset_counters()
+        self.batches = collections.OrderedDict()
 
-    def _reset_counters(self):
-        self.started = time.monotonic()
-        self.expected = 0
-        self.stored = 0
-        self.rejected = 0
-        self.bytes = 0
+    # -- batch bookkeeping ------------------------------------------------
 
-    def _finish_batch(self):
-        """Emit the summary for the batch that just ended (or was cut off).
-
-        Note there is no timeout: if the last file of a batch is lost, this
-        does not fire until the next manifest arrives.  Alert on a
-        'batch_sent' with no matching 'batch_received' rather than waiting
-        for one that may be late.
-        """
-        if self.batch is None:
-            return
+    def _summarize(self, batch, reason):
+        # Name every file that never arrived.  Because a damaged transfer
+        # can no longer be attributed to a particular file, this is where
+        # you learn WHICH files are missing -- more useful than the old
+        # per-blob mismatch line, which was often blaming the wrong name.
+        for entries in batch.by_hash.values():
+            for entry in entries:
+                log.warning("file %s never arrived (batch %s, %s)",
+                            entry["path"], batch.id[:8], reason)
+                common.log_event("file_missing", module=self.module,
+                                 per_file=True, batch=batch.id[:8],
+                                 path=entry["path"], bytes=entry["size"],
+                                 reason=reason)
         common.log_event("batch_received", module=self.module,
-                         batch=(self.batch or "?")[:8],
-                         files=self.expected, files_stored=self.stored,
-                         files_rejected=self.rejected,
-                         files_missing=len(self.pending),
-                         bytes=self.bytes,
-                         duration_s=round(time.monotonic() - self.started, 3))
+                         batch=batch.id[:8], files=batch.expected,
+                         files_stored=batch.stored,
+                         files_rejected=batch.rejected,
+                         files_missing=batch.outstanding,
+                         bytes=batch.bytes, reason=reason,
+                         duration_s=round(time.monotonic() - batch.started, 3))
+        if batch.outstanding:
+            log.warning("batch %s closed with %d file(s) never received (%s)",
+                        batch.id[:8], batch.outstanding, reason)
+
+    def sweep(self, batch_timeout):
+        """Close batches that have gone quiet.
+
+        Without this an incomplete batch would sit open until four more
+        manifests pushed it out, so on a quiet link its summary -- and the
+        list of files that never arrived -- could be days late.
+        """
+        if not batch_timeout:
+            return
+        now = time.monotonic()
+        for batch in list(self.batches.values()):
+            if now - batch.last_activity >= batch_timeout:
+                self._close(batch, "timeout")
+
+    def _close(self, batch, reason):
+        self.batches.pop(batch.id, None)
+        self._summarize(batch, reason)
+
+    def _add_batch(self, manifest):
+        batch = _Batch(manifest)
+        # A re-sent file supersedes the outstanding entry in any older open
+        # batch, so one file is not reported missing twice.
+        for older in list(self.batches.values()):
+            for path in batch.paths:
+                older.drop_path(path)
+            if not older.outstanding:
+                self._close(older, "superseded")
+        self.batches[batch.id] = batch
+        while len(self.batches) > self.RETAIN_BATCHES:
+            _, oldest = self.batches.popitem(last=False)
+            self._summarize(oldest, "evicted")
+        return batch
+
+    def close_all(self, reason="shutdown"):
+        for batch in list(self.batches.values()):
+            self._close(batch, reason)
+
+    @property
+    def pending(self):
+        """Entries still outstanding across every open batch."""
+        return [e for b in self.batches.values()
+                for v in b.by_hash.values() for e in v]
+
+    # -- the state machine ------------------------------------------------
 
     def handle(self, blob):
         """Process one received file. Always consumes (moves or deletes) it.
         Returns one of: 'manifest', 'stored', 'rejected', 'orphan'."""
         manifest = read_manifest(blob)
         if manifest is not None:
-            if self.pending:
-                log.warning("batch %s interrupted: %d file(s) never arrived",
-                            (self.batch or "?")[:8], len(self.pending))
-            self._finish_batch()
-            self.pending = list(manifest["files"])
-            self.batch = manifest.get("batch")
-            self._reset_counters()
-            self.expected = len(self.pending)
+            batch = self._add_batch(manifest)
             log.info("manifest received: %d file(s), batch %s",
-                     len(self.pending), (self.batch or "?")[:8])
+                     batch.expected, batch.id[:8])
             common.log_event("manifest_received", module=self.module,
-                             batch=(self.batch or "?")[:8],
-                             files=self.expected)
+                             batch=batch.id[:8], files=batch.expected)
             os.remove(blob)
             return "manifest"
 
-        if not self.pending:
+        size = os.path.getsize(blob)
+        if not self.batches:
             log.warning("received a file with no manifest pending; discarded")
-            common.log_event("file_orphaned", module=self.module,
-                             bytes=os.path.getsize(blob))
+            common.log_event("file_orphaned", module=self.module, bytes=size)
             os.remove(blob)
             return "orphan"
 
-        entry = self.pending.pop(0)
+        # Skip hashing a blob whose length matches nothing we are waiting
+        # for: that is the common case for a transfer damaged in flight.
+        if any(size in b.sizes for b in self.batches.values()):
+            digest = hash_file(blob)
+        else:
+            digest = None
+
+        batch = entry = None
+        if digest is not None:
+            for candidate in self.batches.values():
+                entry = candidate.take(digest)
+                if entry is not None:
+                    batch = candidate
+                    break
+
+        if entry is None:
+            log.error("received %d bytes matching no expected file; discarded",
+                      size)
+            common.log_event("file_rejected", module=self.module, per_file=True,
+                             reason="no_matching_file", bytes=size)
+            for candidate in self.batches.values():
+                candidate.rejected += 1
+                break
+            os.remove(blob)
+            return "rejected"
+
         dest = safe_join(self.out_dir, entry["path"])
         if dest is None:
             log.error("unsafe path %r in manifest; file discarded", entry["path"])
-            self.rejected += 1
+            batch.rejected += 1
             common.log_event("file_rejected", module=self.module, per_file=True,
-                             batch=(self.batch or "?")[:8], path=entry["path"],
+                             batch=batch.id[:8], path=entry["path"],
                              reason="unsafe_path")
             os.remove(blob)
-            self._finish_if_done()
+            self._finish_if_done(batch)
             return "rejected"
-        size = os.path.getsize(blob)
-        if size != entry["size"] or hash_file(blob) != entry["sha256"]:
-            log.error("checksum mismatch for %s (got %d bytes, expected %d); discarded",
-                      entry["path"], size, entry["size"])
-            self.rejected += 1
-            common.log_event("file_rejected", module=self.module, per_file=True,
-                             batch=(self.batch or "?")[:8], path=entry["path"],
-                             reason="checksum_mismatch", bytes=size,
-                             expected_bytes=entry["size"])
-            os.remove(blob)
-            self._finish_if_done()
-            return "rejected"
+
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         os.replace(blob, dest)            # atomic: same filesystem
         log.info("file %s available at %s", entry["path"], dest)
-        self.stored += 1
-        self.bytes += size
+        batch.stored += 1
+        batch.bytes += size
+        batch.last_activity = time.monotonic()
         common.log_event("file_stored", module=self.module, per_file=True,
-                         batch=(self.batch or "?")[:8], path=entry["path"],
-                         bytes=size)
-        self._finish_if_done()
+                         batch=batch.id[:8], path=entry["path"], bytes=size)
+        self._finish_if_done(batch)
         return "stored"
 
-    def _finish_if_done(self):
-        if not self.pending:
-            self._finish_batch()
-            self.batch = None
+    def _finish_if_done(self, batch):
+        if not batch.outstanding:
+            self._close(batch, "complete")
+
+
+def staging_dir(props):
+    """Where incoming transfers are written before they are verified.
+
+    This must NOT be inside the output folder.  udp-receiver writes here for
+    the whole duration of a transfer, so anything serving the output folder
+    -- NFS, SFTP, rsync, an indexer -- would otherwise hand out growing,
+    unverified partial files.  The default is a sibling directory, which
+    keeps it on the same filesystem so the final os.replace stays atomic.
+    """
+    configured = props.get("staging")
+    if configured:
+        return configured
+    out_dir = props["out"].rstrip(os.sep)
+    return out_dir + ".incoming"
 
 
 def run_folder_output(name, props, cfg):
-    """Output agent: receive files forever into props['out']."""
+    """Output agent: receive files forever into props['out'].
+
+    Verification runs in a worker thread so that udp-receiver is restarted
+    immediately after each transfer.  The earlier version hashed and moved
+    the file before re-opening the socket, and a diode has no flow control:
+    at line rate the sender had already pushed hundreds of megabytes of the
+    next file into a closed socket by the time we were listening again.
+    """
     common.setup_logging(cfg.get("_log_level", "INFO"), cfg)
     out_dir = props["out"]
-    staging = os.path.join(out_dir, STAGING_DIR)
+    staging = staging_dir(props)
+    os.makedirs(out_dir, exist_ok=True)
     os.makedirs(staging, exist_ok=True)
+    if os.path.commonpath([os.path.abspath(staging), os.path.abspath(out_dir)]) \
+            == os.path.abspath(out_dir):
+        log.warning("staging folder %s is inside the output folder: anything "
+                    "serving %s will see partial files", staging, out_dir)
     # Clear leftovers from a previous crash.
     for leftover in os.listdir(staging):
-        os.remove(os.path.join(staging, leftover))
+        try:
+            os.remove(os.path.join(staging, leftover))
+        except OSError:
+            pass
+
     transport = UdpCast(props, cfg)
     receiver = FolderReceiver(out_dir, module=name)
-    log.info("module %r: receiving into %s (port %d)", name, out_dir, props["port"])
+    log.info("module %r: receiving into %s via %s (port %d)",
+             name, out_dir, staging, props["port"])
+
+    # Bounded, so a slow disk applies backpressure instead of filling it.
+    work = queue.Queue(maxsize=4)
+
+    batch_timeout = float(props.get("batch_timeout", 300.0))
+
+    def verify_loop():
+        while True:
+            try:
+                blob = work.get(timeout=min(30.0, batch_timeout or 30.0))
+            except queue.Empty:
+                receiver.sweep(batch_timeout)   # report what never arrived
+                continue
+            try:
+                receiver.handle(blob)
+            except OSError as err:
+                log.error("could not store received file: %s", err)
+                if os.path.exists(blob):
+                    try:
+                        os.remove(blob)
+                    except OSError:
+                        pass
+            finally:
+                work.task_done()
+
+    threading.Thread(target=verify_loop, name="verify", daemon=True).start()
+
     while True:
         fd, blob = tempfile.mkstemp(dir=staging)
         os.close(fd)
@@ -426,9 +665,4 @@ def run_folder_output(name, props, cfg):
             os.remove(blob)
             time.sleep(1.0)
             continue
-        try:
-            receiver.handle(blob)
-        except OSError as err:
-            log.error("could not store received file: %s", err)
-            if os.path.exists(blob):
-                os.remove(blob)
+        work.put(blob)
