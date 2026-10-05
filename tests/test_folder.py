@@ -1,9 +1,11 @@
 import collections
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 import _setup  # noqa: F401
 import dyode
@@ -214,6 +216,142 @@ class UdpCastCommandTests(unittest.TestCase):
         recv = cast.receiver_cmd("/out/f")
         self.assertEqual(recv[recv.index("--interface") + 1], "enxBB")
         self.assertEqual(recv[recv.index("--mcast-rdv-addr") + 1], "10.9.0.1")
+
+
+class UnattendedUdpcastTests(unittest.TestCase):
+    """Regression: the service worked by hand but moved nothing under
+    systemd, where stdin is /dev/null and the box may boot before the
+    diode NIC is configured."""
+
+    NET = {"network": {"in_ip": "10.9.0.1", "out_ip": "10.9.0.2",
+                       "in_interface": "eth0", "out_interface": "eth1"}}
+
+    def cast(self, **extra):
+        props = {"port": 9600, "bitrate": 900}
+        props.update(extra)
+        return dyode.UdpCast(props, self.NET)
+
+    def test_both_commands_disable_keyboard_input(self):
+        """udp-sender(1)/udp-receiver(1) otherwise read a start signal from
+        the keyboard and print a 'press any key' prompt."""
+        self.assertIn("--nokbd", self.cast().sender_cmd("/in/f"))
+        self.assertIn("--nokbd", self.cast().receiver_cmd("/out/f"))
+
+    def test_autostart_counts_hello_retransmissions_not_receivers(self):
+        cmd = self.cast().sender_cmd("/in/f")
+        self.assertEqual(cmd[cmd.index("--autostart") + 1], "5")
+        cmd = self.cast(autostart=12).sender_cmd("/in/f")
+        self.assertEqual(cmd[cmd.index("--autostart") + 1], "12")
+
+    def test_receiver_start_timeout_is_explicit_and_can_be_disabled(self):
+        cmd = self.cast().receiver_cmd("/out/f")
+        self.assertEqual(cmd[cmd.index("--start-timeout") + 1], "300")
+        self.assertNotIn("--start-timeout",
+                         self.cast(start_timeout=0).receiver_cmd("/out/f"))
+
+    def test_output_path_is_still_the_last_argument(self):
+        for cmd in (self.cast().sender_cmd("/in/f"),
+                    self.cast().receiver_cmd("/out/f")):
+            self.assertEqual(cmd[-2:], ["-f", cmd[-1]])
+
+
+class IdleReceiverTests(unittest.TestCase):
+    """An idle diode hits udp-receiver's start timeout constantly. Treating
+    that as a failure logged errors and, worse, slept a second before
+    listening again -- a window in which a transfer is missed outright."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="dyode_idle_")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.blob = os.path.join(self.dir, "blob")
+        self.cast = dyode.UdpCast(
+            {"port": 9600},
+            {"network": {"in_ip": "10.9.0.1", "out_ip": "10.9.0.2",
+                         "in_interface": "eth0", "out_interface": "eth1"}})
+
+    def fake_run(self, ok, stderr, blob_bytes=b""):
+        with open(self.blob, "wb") as fh:
+            fh.write(blob_bytes)
+
+        def runner(cmd, quiet=False):
+            return ok, stderr
+        self.cast._run = runner
+
+    def test_start_timeout_with_no_bytes_is_idle(self):
+        self.fake_run(False, "udp-receiver: timeout waiting for sender")
+        with self.assertNoLogs("dyode.folder", "WARNING"):
+            self.assertEqual(self.cast.receive(self.blob), "idle")
+
+    def test_timeout_after_bytes_arrived_is_a_real_error(self):
+        """A stalled transfer must not be mistaken for an idle link."""
+        self.fake_run(False, "udp-receiver: reception timeout",
+                      blob_bytes=b"partial")
+        with self.assertLogs("dyode.folder", "ERROR"):
+            self.assertEqual(self.cast.receive(self.blob), "error")
+
+    def test_other_failures_are_still_errors(self):
+        self.fake_run(False, "udp-receiver: invalid interface eth9")
+        with self.assertLogs("dyode.folder", "ERROR"):
+            self.assertEqual(self.cast.receive(self.blob), "error")
+
+    def test_success_is_ok(self):
+        self.fake_run(True, "")
+        self.assertEqual(self.cast.receive(self.blob), "ok")
+
+
+class StaticArpTests(unittest.TestCase):
+    """The entry is lost on a link flap and cannot be set before the NIC has
+    an address, and nothing on a one-way link reports either."""
+
+    NET = {"in_ip": "10.9.0.1", "out_ip": "10.9.0.2",
+           "in_interface": "eth0", "out_interface": "eth1",
+           "out_mac": "b8:27:eb:b1:ff:ab"}
+
+    def test_missing_mac_is_not_a_success(self):
+        with self.assertLogs("dyode.folder", "WARNING"):
+            self.assertFalse(dyode.set_static_arp(dict(self.NET, out_mac=None)))
+
+    def test_command_is_an_argument_list_with_permanent_nud(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+        with unittest.mock.patch.object(subprocess, "run", fake_run):
+            self.assertTrue(dyode.set_static_arp(dict(self.NET)))
+        self.assertEqual(seen["cmd"][:3], ["ip", "neigh", "replace"])
+        self.assertEqual(seen["cmd"][-2:], ["nud", "permanent"])
+        self.assertIn("b8:27:eb:b1:ff:ab", seen["cmd"])
+        self.assertEqual(seen["cmd"][seen["cmd"].index("dev") + 1], "eth0")
+
+    def test_failure_is_reported_not_swallowed(self):
+        def fake_run(cmd, **kw):
+            return subprocess.CompletedProcess(
+                cmd, 2, b"", b"Cannot find device \"eth0\"")
+        with unittest.mock.patch.object(subprocess, "run", fake_run):
+            with self.assertLogs("dyode.folder", "ERROR") as logs:
+                self.assertFalse(dyode.set_static_arp(dict(self.NET)))
+        self.assertIn("Cannot find device", "\n".join(logs.output))
+
+    def test_keeper_retries_and_logs_only_transitions(self):
+        results = [False, False, True, True]
+        calls = []
+
+        def fake_set(net):
+            if not results:
+                raise KeyboardInterrupt        # ends the keeper loop
+            calls.append(net)
+            return results.pop(0)
+        with unittest.mock.patch.object(dyode, "set_static_arp", fake_set), \
+                unittest.mock.patch.object(dyode.time, "sleep", lambda s: None):
+            with self.assertLogs("dyode.folder") as logs:
+                with self.assertRaises(KeyboardInterrupt):
+                    dyode.run_arp_keeper(dict(self.NET), interval=0)
+        self.assertEqual(len(calls), 4)
+        text = "\n".join(logs.output)
+        # One failure transition and one recovery, not one line per pass.
+        self.assertEqual(text.count("is NOT in place"), 1)
+        self.assertEqual(text.count("entry in place"), 1)
 
 
 class SentFileRetentionTests(unittest.TestCase):

@@ -111,41 +111,150 @@ class UdpCast:
         # Normalized by common._normalize_module: a ratio string, or None
         # when forward error correction is switched off for this module.
         self.fec = props.get("fec", common.DEFAULT_FEC)
+        # NOT a receiver count.  udp-sender(1): "Starts transmission after n
+        # retransmissions of hello packet, without waiting for a key stroke."
+        # On a diode no receiver can ever answer the hello, so this is the
+        # sender's ONLY way to give the output box time to have udp-receiver
+        # listening.  It costs that delay on every file, so it trades
+        # small-file throughput against reliability.
+        self.autostart = int(props.get("autostart", 5))
+        # udp-receiver(1): "receiver aborts at start if it doesn't see a
+        # sender within this many seconds."  An idle diode hits this
+        # constantly and that is normal, not a failure -- see receive().
+        # 0 omits the flag so the receiver waits indefinitely.
+        self.start_timeout = int(props.get("start_timeout", 300))
         self.in_ip, self.out_ip = net["in_ip"], net["out_ip"]
         self.in_if, self.out_if = net["in_interface"], net["out_interface"]
 
     def sender_cmd(self, path):
-        cmd = ["udp-sender", "--async"]
+        # --nokbd because this runs as a systemd service: udp-sender(1)
+        # otherwise reads a start signal from the keyboard and prints a
+        # "press any key" prompt, and under systemd stdin is /dev/null.
+        cmd = ["udp-sender", "--async", "--nokbd"]
         if self.fec:
             cmd += ["--fec", self.fec]
         cmd += ["--max-bitrate", "%dm" % self.bitrate,
                 "--mcast-rdv-addr", self.out_ip, "--mcast-data-addr", self.out_ip,
-                "--portbase", str(self.port), "--autostart", "1",
+                "--portbase", str(self.port),
+                "--autostart", str(self.autostart),
                 "--interface", self.in_if, "-f", path]
         return cmd
 
     def receiver_cmd(self, path):
-        return ["udp-receiver", "--nosync", "--mcast-rdv-addr", self.in_ip,
-                "--interface", self.out_if, "--portbase", str(self.port), "-f", path]
+        cmd = ["udp-receiver", "--nosync", "--nokbd",
+               "--mcast-rdv-addr", self.in_ip,
+               "--interface", self.out_if, "--portbase", str(self.port)]
+        if self.start_timeout:
+            cmd += ["--start-timeout", str(self.start_timeout)]
+        return cmd + ["-f", path]
 
     @staticmethod
-    def _run(cmd):
+    def _run(cmd, quiet=False):
+        """Run cmd. Returns (ok, stderr_text)."""
         log.debug("running: %s", cmd)
         try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            res = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except FileNotFoundError:
             common.die("%s not found: install udpcast" % cmd[0])
+        text = res.stderr.decode(errors="replace").strip()
         if res.returncode != 0:
-            log.error("%s failed (exit %d): %s", cmd[0], res.returncode,
-                      res.stderr.decode(errors="replace").strip()[-500:])
-            return False
-        return True
+            if not quiet:
+                log.error("%s failed (exit %d): %s", cmd[0], res.returncode,
+                          text[-500:])
+            return False, text
+        return True, text
 
     def send(self, path):
-        return self._run(self.sender_cmd(path))
+        return self._run(self.sender_cmd(path))[0]
 
     def receive(self, path):
-        return self._run(self.receiver_cmd(path))
+        """Wait for one transfer.
+
+        Returns 'ok', 'idle' (the start timeout expired with no sender,
+        which is the normal state of a quiet diode) or 'error'.  The caller
+        must not back off on 'idle': every second spent not listening is a
+        second in which the sender can transmit a file nobody receives.
+        """
+        ok, text = self._run(self.receiver_cmd(path), quiet=True)
+        if ok:
+            return "ok"
+        if self._is_idle_timeout(text, path):
+            log.debug("no sender within %ds; listening again",
+                      self.start_timeout)
+            return "idle"
+        log.error("udp-receiver failed: %s", text[-500:] or "(no output)")
+        return "error"
+
+    @staticmethod
+    def _is_idle_timeout(text, path):
+        """Tell 'nothing was being sent' apart from a real failure."""
+        if "timeout" not in text.lower():
+            return False
+        # A start timeout leaves the output file untouched; a transfer that
+        # began and then stalled leaves bytes behind and is a real problem.
+        try:
+            return os.path.getsize(path) == 0
+        except OSError:
+            return False
+
+
+# --------------------------------------------------------------------------
+# Static ARP (input side)
+# --------------------------------------------------------------------------
+
+def set_static_arp(net):
+    """Pin the output box's MAC. Returns True on success.
+
+    Nothing can answer ARP through a one-way link, so without this entry the
+    kernel cannot resolve the destination MAC and drops every outbound
+    packet locally -- udp-sender still exits 0, the receiver simply never
+    sees a thing.  Uses iproute2; net-tools' `arp` is not installed by
+    default on current Debian / Raspberry Pi OS.
+    """
+    if not net.get("out_mac"):
+        log.warning("no dyode_out.mac in config: skipping static ARP entry")
+        return False
+    cmd = ["ip", "neigh", "replace", net["out_ip"], "lladdr", net["out_mac"],
+           "dev", net["in_interface"], "nud", "permanent"]
+    try:
+        res = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        log.error("'ip' command not found: install iproute2")
+        return False
+    if res.returncode == 0:
+        return True
+    log.error("static ARP failed (run as root? is %s up?): %s",
+              net["in_interface"],
+              res.stderr.decode(errors="replace").strip())
+    return False
+
+
+def run_arp_keeper(net, interval=60.0):
+    """Re-assert the static ARP entry for as long as DYODE runs.
+
+    Setting it once at start-up was not enough.  The entry is lost whenever
+    the interface goes down and comes back, and at boot the service can
+    start before the diode NIC has its address, in which case the entry was
+    never established at all.  Either way every transfer afterwards went
+    nowhere while both sides reported success -- so this is supervised like
+    any other module and keeps putting it back.
+    """
+    log.info("ARP keeper: pinning %s -> %s on %s every %gs",
+             net["out_ip"], net.get("out_mac"), net["in_interface"], interval)
+    healthy = None
+    while True:
+        ok = set_static_arp(net)
+        if ok != healthy:                 # log transitions, not every pass
+            if ok:
+                log.info("static ARP entry in place: %s -> %s on %s",
+                         net["out_ip"], net["out_mac"], net["in_interface"])
+            else:
+                log.error("static ARP entry is NOT in place; nothing this box "
+                          "sends can reach the output side")
+            healthy = ok
+        time.sleep(interval)
 
 
 # --------------------------------------------------------------------------
@@ -661,8 +770,14 @@ def run_folder_output(name, props, cfg):
     while True:
         fd, blob = tempfile.mkstemp(dir=staging)
         os.close(fd)
-        if not transport.receive(blob):
-            os.remove(blob)
-            time.sleep(1.0)
+        outcome = transport.receive(blob)
+        if outcome == "ok":
+            work.put(blob)
             continue
-        work.put(blob)
+        os.remove(blob)
+        if outcome == "error":
+            # Back off only on a genuine failure, to avoid a tight loop.
+            # An 'idle' timeout must NOT sleep: the sender cannot be asked
+            # to wait, so any pause here is a window in which a transfer is
+            # missed entirely.
+            time.sleep(1.0)

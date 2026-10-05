@@ -197,6 +197,73 @@ class ConfigModelTests(unittest.TestCase):
         self.assertIn("ExecStart=/opt/dyode/DYODE_v1_full/venv/bin/python dyode_out.py", unit)
         self.assertIn("Restart=always", unit)
         self.assertIn("port 502", unit)
+        # udp-sender/udp-receiver behave differently on a terminal.
+        self.assertIn("StandardInput=null", unit)
+
+    def test_unit_waits_for_the_diode_nic(self):
+        """network-online.target does not mean the hand-configured diode
+        interface has its address; starting without it silently moves
+        nothing."""
+        unit = core.systemd_unit_text("v1", "in", "/opt/dyode/DYODE_v1_full",
+                                      interface="eth0")
+        device = "sys-subsystem-net-devices-eth0.device"
+        self.assertIn("After=%s" % device, unit)
+        self.assertIn("BindsTo=%s" % device, unit)
+        # BindsTo only propagates the stop; this restarts after a flap.
+        self.assertIn("WantedBy=%s" % device, unit)
+        self.assertIn("WantedBy=multi-user.target", unit)
+        self.assertIn("ExecStartPre=", unit)
+        self.assertIn("ip -4 addr show dev eth0", unit)
+        # A long outage must not leave the unit permanently dead.
+        self.assertIn("StartLimitIntervalSec=0", unit)
+
+    def test_unit_without_an_interface_has_no_device_dependency(self):
+        unit = core.systemd_unit_text("v1", "in", "/opt/dyode/DYODE_v1_full")
+        self.assertNotIn("sys-subsystem-net-devices", unit)
+        self.assertNotIn("ExecStartPre=", unit)
+
+    def test_every_directive_is_in_a_section_and_well_formed(self):
+        unit = core.systemd_unit_text("v1", "in", "/opt/dyode/DYODE_v1_full",
+                                      interface="eth0")
+        section = None
+        for line in unit.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line
+                continue
+            self.assertIsNotNone(section, "directive before any section: %r" % line)
+            self.assertIn("=", line, "not a directive: %r" % line)
+
+    def test_device_unit_names_are_escaped(self):
+        self.assertEqual(core.device_unit("eth0"),
+                         "sys-subsystem-net-devices-eth0.device")
+        # A VLAN keeps its dot; a dash must be escaped or the unit never
+        # matches and the dependency quietly does nothing.
+        self.assertEqual(core.device_unit("eth0.100"),
+                         "sys-subsystem-net-devices-eth0.100.device")
+        self.assertEqual(core.device_unit("br-lan"),
+                         "sys-subsystem-net-devices-br\\x2dlan.device")
+
+    def test_generated_unit_uses_the_side_s_own_interface(self):
+        model = core.ConfigModel()
+        model.variant, model.in_if, model.out_if = "v1", "enp1s0", "enp2s0"
+        model.in_ip, model.out_ip = "10.0.1.1", "10.0.1.2"
+        model.out_mac = "b8:27:eb:b1:ff:ab"
+        model.modules = [core.Module("m", {"type": "folder", "port": 9600,
+                                           "in": "/srv/in",
+                                           "out": "/srv/out"})]
+        repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        for sub in ("DYODE_v1_full",):
+            os.makedirs(os.path.join(repo, sub), exist_ok=True)
+        for side, expected in (("in", "enp1s0"), ("out", "enp2s0")):
+            plan = core.Plan(model, side, core.target_dir("v1", side, repo))
+            plan.write_unit = True
+            plan.unit_path = os.path.join(plan.workdir, core.unit_name(side))
+            plan.apply()
+            with open(plan.unit_path) as fh:
+                self.assertIn("dev %s" % expected, fh.read())
 
 
 class WizardFlowTests(unittest.TestCase):

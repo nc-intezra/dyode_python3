@@ -8,6 +8,11 @@ dyode_in:
   ip: 10.0.1.1
   mac: b8:27:eb:89:1e:f3
   interface: eth0          # optional (new): NIC facing the diode, default eth0
+  arp_interval: 60         # optional (new): seconds between re-asserting the
+                           # static ARP entry.  It is lost when the NIC goes
+                           # down and comes back, and without it every
+                           # transfer is dropped by our own kernel while
+                           # udp-sender still reports success.
 dyode_out:
   ip: 10.0.1.2
   mac: b8:27:eb:b1:ff:ab   # used for the static ARP entry on the input box
@@ -28,6 +33,19 @@ modules:
     port: 9600
     in: /home/pi/in
     out: /home/pi/out
+    # optional: autostart: 5   udp-sender --autostart: hello RETRANSMISSIONS
+    #                           before data starts (not a receiver count --
+    #                           no receiver can answer through a diode).
+    #                           This is the only grace period the output box
+    #                           gets to have udp-receiver listening, and it
+    #                           costs that delay on every file.  Raise it if
+    #                           files go missing; lower it if you move
+    #                           thousands of small files.
+    # optional: start_timeout: 300
+    #                           udp-receiver --start-timeout.  An idle diode
+    #                           hits this constantly, which is normal; the
+    #                           socket is reopened immediately.  0 waits
+    #                           indefinitely.
     # optional: settle: 2       seconds a file must be unchanged before sending
     # optional: bitrate: 4      Mbit/s; default = 8 shared across folder modules
     # optional: file_gap: 0.5   seconds to pause between files, so the output

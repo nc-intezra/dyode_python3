@@ -260,6 +260,11 @@ def load_config(path):
     if d_out.get("interface"):
         net["out_interface"] = str(d_out["interface"])
     net["out_mac"] = str(d_out["mac"]) if d_out.get("mac") else None
+    # How often the input box re-asserts the static ARP entry.  It is lost
+    # when the diode NIC goes down and comes back, and nothing on a one-way
+    # link will ever tell us so.
+    net["arp_interval"] = _positive_number(
+        "dyode_in", "arp_interval", d_in.get("arp_interval", 60.0))
     cfg["network"] = net
 
     serial_cfg = dict(DEFAULT_SERIAL)
@@ -352,6 +357,15 @@ def _normalize_module(name, props):
             props["batch_timeout"] = _positive_number(
                 name, "batch_timeout", props.get("batch_timeout", 300.0),
                 allow_zero=True)
+            # udp-sender --autostart: hello retransmissions before data
+            # starts, which on a diode is the only grace period the output
+            # box gets to have udp-receiver listening.
+            props["autostart"] = _positive_number(
+                name, "autostart", props.get("autostart", 5), integer=True)
+            # udp-receiver --start-timeout; 0 waits indefinitely.
+            props["start_timeout"] = _positive_number(
+                name, "start_timeout", props.get("start_timeout", 300),
+                allow_zero=True, integer=True)
             if props.get("staging") is not None:
                 staging = str(props["staging"]).strip()
                 if not os.path.isabs(staging):

@@ -369,22 +369,82 @@ def target_dir(variant, side, repo_root=REPO_ROOT):
     return os.path.join(repo_root, "DYODE_v2_light", "in" if side == "in" else "out")
 
 
-def systemd_unit_text(variant, side, workdir, python_exe=None):
+def systemd_escape(text):
+    """systemd-escape(1) for a path component used in a unit name.
+
+    Interface names are usually plain, but a VLAN ('eth0.100') or an altname
+    with a dash has to be escaped or the .device unit never matches and the
+    dependency silently does nothing.
+    """
+    out = []
+    for i, ch in enumerate(text):
+        if ch == "/":
+            out.append("-")
+        elif ch.isalnum() or ch == "_":
+            out.append(ch)
+        elif ch == "." and i > 0:
+            out.append(ch)
+        else:
+            out.append("\\x%02x" % ord(ch))
+    return "".join(out)
+
+
+def device_unit(interface):
+    """The .device unit systemd creates for a network interface."""
+    return "sys-subsystem-net-devices-%s.device" % systemd_escape(interface)
+
+
+def wait_for_address_cmd(interface, seconds=60):
+    """Shell that waits for the interface to have an IPv4 address.
+
+    network-online.target only promises that *some* network is up.  The
+    diode NIC is configured by hand, so at boot this service can easily
+    start before that address exists -- and then the static ARP entry
+    cannot be set and every transfer afterwards goes nowhere while both
+    sides report success.  Waiting here is what makes the unit honest.
+    """
+    return ("/bin/sh -c 'for i in $(seq 1 %d); do "
+            "ip -4 addr show dev %s 2>/dev/null | grep -q \"inet \" && exit 0; "
+            "sleep 1; done; "
+            "echo \"%s still has no IPv4 address after %ds\" >&2; exit 1'"
+            % (seconds, interface, interface, seconds))
+
+
+def systemd_unit_text(variant, side, workdir, python_exe=None, interface=None):
     script = "dyode_in.py" if side == "in" else "dyode_out.py"
     python_exe = python_exe or os.path.join(workdir, "venv", "bin", "python")
     reason = ("the static ARP entry" if side == "in"
               else "binding the Modbus server to port 502")
-    return "\n".join([
+    lines = [
         "[Unit]",
         "Description=DYODE %s side (%s)" % (side_word(side), variant),
         "After=network-online.target",
         "Wants=network-online.target",
+    ]
+    if interface:
+        lines += [
+            "# Stop and restart with the diode NIC, and do not start without it.",
+            "After=%s" % device_unit(interface),
+            "BindsTo=%s" % device_unit(interface),
+        ]
+    lines += [
+        # A diode may sit behind a network that takes a long time to come
+        # back.  Without this, five quick restarts leave the unit dead for
+        # good, and nothing is watching to notice.
+        "StartLimitIntervalSec=0",
         "",
         "[Service]",
         "WorkingDirectory=%s" % workdir,
+    ]
+    if interface:
+        lines.append("ExecStartPre=%s" % wait_for_address_cmd(interface))
+    lines += [
         "ExecStart=%s %s" % (python_exe, script),
         "Restart=always",
         "RestartSec=5",
+        # udpcast and the agents never read stdin; be explicit, because
+        # udp-sender/udp-receiver change behaviour when it is a terminal.
+        "StandardInput=null",
         # Creates /var/log/dyode-transfer with the right mode before start.
         "LogsDirectory=dyode-transfer",
         "LogsDirectoryMode=0750",
@@ -393,8 +453,14 @@ def systemd_unit_text(variant, side, workdir, python_exe=None):
         "",
         "[Install]",
         "WantedBy=multi-user.target",
-        "",
-    ])
+    ]
+    if interface:
+        # BindsTo only propagates the STOP when the NIC disappears.  This is
+        # what brings DYODE back when it reappears, so a link flap does not
+        # leave a dead service nobody is watching.
+        lines.append("WantedBy=%s" % device_unit(interface))
+    lines.append("")
+    return "\n".join(lines)
 
 
 def unit_name(side):
@@ -440,7 +506,10 @@ class Plan:
         if backup:
             self.backups.append(backup)
         if self.write_unit:
-            text = systemd_unit_text(self.model.variant, self.side, self.workdir)
+            iface = (self.model.in_if if self.side == "in"
+                     else self.model.out_if)
+            text = systemd_unit_text(self.model.variant, self.side,
+                                     self.workdir, interface=iface)
             backup = backup_and_write(self.unit_path, text)
             self.created.append(self.unit_path)
             if backup:

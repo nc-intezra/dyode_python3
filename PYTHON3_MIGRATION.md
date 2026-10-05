@@ -117,6 +117,9 @@ Everything below is optional; defaults match the original behaviour.
 | `keep_sent_hours` | folder module | `24` | how long sent files are kept under `.dyode_sent`; `0` deletes them |
 | `staging` | folder module | `<out>.incoming` | where transfers land before verification; must be outside `out` |
 | `batch_timeout` | folder module | `300` | seconds before an incomplete batch is closed and its missing files named |
+| `autostart` | folder module | `5` | `udp-sender` hello retransmissions before data starts |
+| `start_timeout` | folder module | `300` | `udp-receiver` start timeout in seconds; `0` waits indefinitely |
+| `dyode_in.arp_interval` | top level | `60` | seconds between re-asserting the static ARP entry |
 | `bitrate` | folder module | 8 ÷ folder modules | udpcast Mbit/s for this module |
 | `fec` | folder module | `8x16/64` | udpcast FEC ratio, or `none` to disable — see *Throughput tuning* below |
 | `logging.dir` | top level | `/var/log/dyode-transfer` | log directory; empty string for stderr only |
@@ -128,6 +131,74 @@ Everything below is optional; defaults match the original behaviour.
 
 Module `type` is now case-insensitive (`Modbus` works), and a typo in the
 config stops start-up with a clear message instead of silently doing nothing.
+
+## Running as a systemd service (changed)
+
+Symptom this fixes: transfers worked when `dyode_in.py` and `dyode_out.py`
+were started by hand, but as a systemd service the output side logged
+timeout errors and no file arrived. Four separate causes, all of which only
+show up unattended.
+
+**The static ARP entry was set once, at start-up.** Nothing can answer ARP
+through a one-way link, so without that entry the kernel cannot resolve the
+destination MAC and drops every outbound packet *locally* — `udp-sender`
+still exits 0 and the input side reports a clean send, while the output side
+sees nothing at all. The entry is also lost whenever the diode NIC goes down
+and comes back, and at boot the service can start before that NIC has its
+hand-configured address, in which case the entry was never established.
+Either way DYODE looked healthy and moved nothing.
+
+Now: `dyode_in.py` refuses to start if it cannot set the entry (so systemd's
+`Restart=always` retries until the interface is ready) and an `arp-keeper`
+process re-asserts it every `arp_interval` seconds, logging only transitions.
+
+**`--nokbd` was missing.** Both tools "read start signal from keyboard, and
+display a message telling the user to press any key to start" unless told
+otherwise, and under systemd stdin is `/dev/null`. Both invocations now pass
+`--nokbd`, stdin is explicitly `/dev/null`, and the unit sets
+`StandardInput=null`.
+
+**`--autostart` was misread as a receiver count.** `udp-sender(1)` defines it
+as "starts transmission after *n* retransmissions of hello packet" — so the
+old `--autostart 1` gave the output box almost no time to have
+`udp-receiver` listening. Default is now 5, configurable per module.
+
+**An idle timeout was treated as a failure.** `udp-receiver` aborts at start
+if it sees no sender, which on a quiet diode is its normal state. That was
+logged as an error *and* followed by a one-second sleep — a window with
+nothing listening, in which a transfer is missed outright. Idle is now
+distinguished from failure (a start timeout leaves the output file empty; a
+stalled transfer does not), logged at debug, and the socket is reopened
+immediately. `start_timeout` is explicit and `0` waits indefinitely.
+
+### The generated unit
+
+`dyode_setup.py` now writes device dependencies for the diode NIC:
+
+```
+After=sys-subsystem-net-devices-eth0.device
+BindsTo=sys-subsystem-net-devices-eth0.device
+StartLimitIntervalSec=0
+...
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip -4 addr show dev eth0 ... '
+StandardInput=null
+...
+[Install]
+WantedBy=multi-user.target
+WantedBy=sys-subsystem-net-devices-eth0.device
+```
+
+`network-online.target` only promises that *some* network is up; it says
+nothing about a hand-configured address on the diode NIC, which is why the
+`ExecStartPre` waits for it. `BindsTo=` stops the service when the NIC
+disappears and the second `WantedBy=` starts it again when the NIC returns,
+so a link flap does not leave a dead service. `StartLimitIntervalSec=0` stops
+five quick restarts from disabling the unit permanently during a long
+outage.
+
+If you installed a unit generated before this change, regenerate it or add
+those lines by hand — the code fixes alone do not repair a unit already in
+`/etc/systemd/system`.
 
 ## Folder transfers: how a file is identified (changed)
 

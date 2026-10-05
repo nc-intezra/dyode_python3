@@ -6,7 +6,6 @@ Setting the static ARP entry needs root; everything else does not.
 """
 
 import logging
-import subprocess
 
 import dyode
 import dyode_common as common
@@ -33,25 +32,9 @@ def run_agent(name, props, cfg):
 
 
 def set_static_arp(net):
-    """Nothing can answer ARP through a one-way link, so the output box's
-    MAC must be pinned. Uses iproute2 (net-tools' `arp` is not installed by
-    default on current Debian / Raspberry Pi OS)."""
-    if not net.get("out_mac"):
-        log.warning("no dyode_out.mac in config: skipping static ARP entry")
-        return
-    cmd = ["ip", "neigh", "replace", net["out_ip"], "lladdr", net["out_mac"],
-           "dev", net["in_interface"], "nud", "permanent"]
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        log.error("'ip' command not found: install iproute2")
-        return
-    if res.returncode == 0:
-        log.info("static ARP: %s -> %s on %s", net["out_ip"], net["out_mac"],
-                 net["in_interface"])
-    else:
-        log.error("static ARP failed (run as root?): %s",
-                  res.stderr.decode(errors="replace").strip())
+    """Kept for backwards compatibility; the real work is in dyode.py so it
+    can also run as a supervised keeper process."""
+    return dyode.set_static_arp(net)
 
 
 def main():
@@ -70,7 +53,16 @@ def main():
     net = cfg["network"]
     log.info("input %s (%s) -> output %s (%s)", net["in_ip"], net["in_interface"],
              net["out_ip"], net["out_mac"] or "MAC not set")
-    set_static_arp(net)
+
+    # Refuse to come up pretending to work.  Without the ARP entry every
+    # transfer is silently discarded by our own kernel while udp-sender
+    # still exits 0, so a service that starts before the diode NIC is
+    # configured looks healthy and moves nothing.  Exiting lets systemd's
+    # Restart=always retry until the interface is ready.
+    if net.get("out_mac") and not dyode.set_static_arp(net):
+        common.die("cannot set the static ARP entry for %s on %s; refusing to "
+                   "start, because nothing would reach the output side"
+                   % (net["out_ip"], net["in_interface"]))
 
     folders = common.modules_of_type(cfg, "folder")
     if folders:
@@ -80,6 +72,9 @@ def main():
 
     targets = [(name, run_agent, (name, props, cfg))
                for name, props in cfg["modules"].items()]
+    if net.get("out_mac"):
+        targets.append(("arp-keeper", dyode.run_arp_keeper,
+                        (net, float(net.get("arp_interval", 60.0)))))
     common.supervise(targets)
 
 
