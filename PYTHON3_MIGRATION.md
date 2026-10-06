@@ -166,10 +166,40 @@ old `--autostart 1` gave the output box almost no time to have
 **An idle timeout was treated as a failure.** `udp-receiver` aborts at start
 if it sees no sender, which on a quiet diode is its normal state. That was
 logged as an error *and* followed by a one-second sleep — a window with
-nothing listening, in which a transfer is missed outright. Idle is now
-distinguished from failure (a start timeout leaves the output file empty; a
-stalled transfer does not), logged at debug, and the socket is reopened
-immediately. `start_timeout` is explicit and `0` waits indefinitely.
+nothing listening, in which a transfer is missed outright. `start_timeout`
+is now explicit (default 300) and `0` waits indefinitely.
+
+The first attempt at telling idle apart from failure looked for the word
+"timeout" in udp-receiver's output. **The real udpcast never says it.** On
+an idle start timeout udpcast 20120424 prints only:
+
+```
+udp-receiver 20120424
+Receiver Error
+```
+
+so the idle exit was still classified as a failure: an `ERROR` line in the
+journal every `start_timeout` seconds, and the one-second deaf window right
+behind it. Measured against a faithful stand-in, the gap before
+`udp-receiver` was listening again was 1.018 s.
+
+Classification now ignores the wording entirely and uses two facts:
+
+| Received bytes | Ran for | Verdict | Logged |
+|---|---|---|---|
+| some | any | transfer started then stalled | `ERROR` |
+| none | ≥ 80% of `start_timeout` | idle — normal | `INFO` once, then `DEBUG` |
+| none | less | failed fast: interface, port, permissions | `ERROR` |
+| none | any, with `start_timeout: 0` | should never have exited | `ERROR` |
+
+Only the error verdicts back off for a second. After an idle timeout the
+socket is reopened in about 15–20 ms. This also closes a hole in the
+string-matching version, which would have swallowed a genuine fast failure
+as "idle" if its message happened to contain the word "timeout".
+
+If you want no periodic restarts at all, `start_timeout: 0` makes
+`udp-receiver` wait indefinitely. You give up automatic recovery from a
+wedged `udp-receiver`, which is rarely needed on a diode.
 
 ### The generated unit
 

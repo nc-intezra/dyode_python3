@@ -1,7 +1,9 @@
 import collections
+import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -258,45 +260,108 @@ class UnattendedUdpcastTests(unittest.TestCase):
 class IdleReceiverTests(unittest.TestCase):
     """An idle diode hits udp-receiver's start timeout constantly. Treating
     that as a failure logged errors and, worse, slept a second before
-    listening again -- a window in which a transfer is missed outright."""
+    listening again -- a window in which a transfer is missed outright.
+
+    Classification is by elapsed time and bytes received, never by udpcast's
+    wording: the first attempt looked for "timeout" in stderr, and the real
+    udpcast says nothing of the kind.
+    """
+
+    # What udpcast 20120424 actually printed on an idle start timeout,
+    # reported from a production journal.  No mention of "timeout".
+    REAL_IDLE_STDERR = "udp-receiver 20120424\nReceiver Error"
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="dyode_idle_")
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.blob = os.path.join(self.dir, "blob")
-        self.cast = dyode.UdpCast(
-            {"port": 9600},
+        self.cast = self.make_cast()
+
+    @staticmethod
+    def make_cast(**props):
+        base = {"port": 9600}
+        base.update(props)
+        return dyode.UdpCast(
+            base,
             {"network": {"in_ip": "10.9.0.1", "out_ip": "10.9.0.2",
                          "in_interface": "eth0", "out_interface": "eth1"}})
 
-    def fake_run(self, ok, stderr, blob_bytes=b""):
+    def fake_run(self, ok, stderr, elapsed, blob_bytes=b"", cast=None):
         with open(self.blob, "wb") as fh:
             fh.write(blob_bytes)
 
         def runner(cmd, quiet=False):
-            return ok, stderr
-        self.cast._run = runner
+            return ok, stderr, elapsed
+        (cast or self.cast)._run = runner
 
-    def test_start_timeout_with_no_bytes_is_idle(self):
-        self.fake_run(False, "udp-receiver: timeout waiting for sender")
+    def test_real_udpcast_idle_message_is_idle(self):
+        """Regression: this exact output was logged as an ERROR every five
+        minutes, and each one bought a one-second deaf window."""
+        self.fake_run(False, self.REAL_IDLE_STDERR, elapsed=300.0)
         with self.assertNoLogs("dyode.folder", "WARNING"):
             self.assertEqual(self.cast.receive(self.blob), "idle")
 
-    def test_timeout_after_bytes_arrived_is_a_real_error(self):
-        """A stalled transfer must not be mistaken for an idle link."""
-        self.fake_run(False, "udp-receiver: reception timeout",
-                      blob_bytes=b"partial")
+    def test_classification_ignores_the_wording(self):
+        for stderr in (self.REAL_IDLE_STDERR, "", "something new in 2031",
+                       "timeout"):
+            self.fake_run(False, stderr, elapsed=299.5)
+            self.assertEqual(self.cast.receive(self.blob), "idle", stderr)
+
+    def test_slightly_early_expiry_still_counts_as_idle(self):
+        """udpcast's timer and ours do not start at the same instant."""
+        self.fake_run(False, self.REAL_IDLE_STDERR, elapsed=241.0)
+        self.assertEqual(self.cast.receive(self.blob), "idle")
+
+    def test_same_message_but_fast_exit_is_a_real_error(self):
+        """A bad interface also prints 'Receiver Error' -- immediately."""
+        self.fake_run(False, self.REAL_IDLE_STDERR, elapsed=0.05)
+        with self.assertLogs("dyode.folder", "ERROR") as logs:
+            self.assertEqual(self.cast.receive(self.blob), "error")
+        self.assertIn("check the interface", "\n".join(logs.output))
+
+    def test_word_timeout_does_not_make_a_fast_failure_idle(self):
+        """The old heuristic would have swallowed this real failure."""
+        self.fake_run(False, "udp-receiver: socket timeout binding eth9",
+                      elapsed=0.2)
         with self.assertLogs("dyode.folder", "ERROR"):
             self.assertEqual(self.cast.receive(self.blob), "error")
 
-    def test_other_failures_are_still_errors(self):
-        self.fake_run(False, "udp-receiver: invalid interface eth9")
-        with self.assertLogs("dyode.folder", "ERROR"):
+    def test_bytes_received_then_stopped_is_a_real_error(self):
+        """A stalled transfer must not be mistaken for an idle link, even
+        after a full start_timeout's worth of waiting."""
+        self.fake_run(False, self.REAL_IDLE_STDERR, elapsed=300.0,
+                      blob_bytes=b"partial")
+        with self.assertLogs("dyode.folder", "ERROR") as logs:
             self.assertEqual(self.cast.receive(self.blob), "error")
+        self.assertIn("started and then stopped", "\n".join(logs.output))
+
+    def test_no_start_timeout_means_any_exit_is_an_error(self):
+        cast = self.make_cast(start_timeout=0)
+        self.fake_run(False, self.REAL_IDLE_STDERR, elapsed=86400.0,
+                      cast=cast)
+        with self.assertLogs("dyode.folder", "ERROR") as logs:
+            self.assertEqual(cast.receive(self.blob), "error")
+        self.assertIn("no start timeout was set", "\n".join(logs.output))
+
+    def test_first_idle_is_noted_once_then_quiet(self):
+        self.fake_run(False, self.REAL_IDLE_STDERR, elapsed=300.0)
+        with self.assertLogs("dyode.folder", "DEBUG") as logs:
+            for _ in range(5):
+                self.assertEqual(self.cast.receive(self.blob), "idle")
+        infos = [r for r in logs.records if r.levelname == "INFO"]
+        self.assertEqual(len(infos), 1)
+        self.assertFalse([r for r in logs.records
+                          if r.levelno >= logging.WARNING])
 
     def test_success_is_ok(self):
-        self.fake_run(True, "")
+        self.fake_run(True, "", elapsed=12.0)
         self.assertEqual(self.cast.receive(self.blob), "ok")
+
+    def test_run_reports_elapsed_time(self):
+        ok, text, elapsed = dyode.UdpCast._run(
+            [sys.executable, "-c", "import time; time.sleep(0.2)"])
+        self.assertTrue(ok)
+        self.assertGreaterEqual(elapsed, 0.2)
 
 
 class StaticArpTests(unittest.TestCase):

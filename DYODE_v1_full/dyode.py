@@ -148,22 +148,29 @@ class UdpCast:
             cmd += ["--start-timeout", str(self.start_timeout)]
         return cmd + ["-f", path]
 
+    # An exit after at least this fraction of start_timeout, with nothing
+    # received, is the start timeout expiring.  Generous rather than exact,
+    # because udpcast's own timer and ours do not start at the same instant.
+    IDLE_FRACTION = 0.8
+
     @staticmethod
     def _run(cmd, quiet=False):
-        """Run cmd. Returns (ok, stderr_text)."""
+        """Run cmd. Returns (ok, stderr_text, elapsed_seconds)."""
         log.debug("running: %s", cmd)
+        started = time.monotonic()
         try:
             res = subprocess.run(cmd, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except FileNotFoundError:
             common.die("%s not found: install udpcast" % cmd[0])
+        elapsed = time.monotonic() - started
         text = res.stderr.decode(errors="replace").strip()
         if res.returncode != 0:
             if not quiet:
                 log.error("%s failed (exit %d): %s", cmd[0], res.returncode,
                           text[-500:])
-            return False, text
-        return True, text
+            return False, text, elapsed
+        return True, text, elapsed
 
     def send(self, path):
         return self._run(self.sender_cmd(path))[0]
@@ -176,27 +183,60 @@ class UdpCast:
         must not back off on 'idle': every second spent not listening is a
         second in which the sender can transmit a file nobody receives.
         """
-        ok, text = self._run(self.receiver_cmd(path), quiet=True)
+        ok, text, elapsed = self._run(self.receiver_cmd(path), quiet=True)
         if ok:
             return "ok"
-        if self._is_idle_timeout(text, path):
-            log.debug("no sender within %ds; listening again",
-                      self.start_timeout)
+        outcome = self._classify_failure(elapsed, path)
+        if outcome == "idle":
+            if not self._idle_seen:
+                log.info("udp-receiver idled out after %ds with no sender; "
+                         "this is normal on a quiet link and is now logged "
+                         "at debug level", self.start_timeout)
+                self._idle_seen = True
+            else:
+                log.debug("no sender within %ds; listening again",
+                          self.start_timeout)
             return "idle"
-        log.error("udp-receiver failed: %s", text[-500:] or "(no output)")
+        log.error("udp-receiver failed after %.1fs (%s): %s", elapsed,
+                  self.FAILURE_REASONS[outcome], text[-500:] or "(no output)")
         return "error"
 
-    @staticmethod
-    def _is_idle_timeout(text, path):
-        """Tell 'nothing was being sent' apart from a real failure."""
-        if "timeout" not in text.lower():
-            return False
-        # A start timeout leaves the output file untouched; a transfer that
-        # began and then stalled leaves bytes behind and is a real problem.
+    _idle_seen = False
+    FAILURE_REASONS = {
+        "stalled": "a transfer started and then stopped",
+        "fast": "exited before its start timeout; check the interface, "
+                "port and permissions",
+        "unexpected": "exited with nothing received although no start "
+                      "timeout was set",
+    }
+
+    def _classify_failure(self, elapsed, path):
+        """Why udp-receiver exited non-zero, judged without reading its text.
+
+        The previous version looked for the word "timeout" in stderr.  The
+        real udpcast prints only its version banner and "Receiver Error",
+        so every idle timeout was reported as a failure -- and the one-second
+        back-off that follows a failure re-opened a deaf window every
+        start_timeout seconds.  udpcast's wording is not ours to rely on;
+        how long it ran and whether it wrote anything are facts.
+
+          'stalled' -- bytes arrived, then the transfer stopped: a real problem
+          'idle'    -- nothing arrived and it ran for ~start_timeout: normal
+          'fast'    -- nothing arrived and it exited early: bad interface,
+                       port in use, permissions -- something to see
+        """
         try:
-            return os.path.getsize(path) == 0
+            received = os.path.getsize(path)
         except OSError:
-            return False
+            received = 0
+        if received:
+            return "stalled"
+        if not self.start_timeout:
+            # Told to wait indefinitely, so it should never have given up.
+            return "unexpected"
+        if elapsed >= self.start_timeout * self.IDLE_FRACTION:
+            return "idle"
+        return "fast"
 
 
 # --------------------------------------------------------------------------
