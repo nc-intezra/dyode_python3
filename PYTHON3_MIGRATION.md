@@ -1,6 +1,6 @@
 # DYODE Python 3 port
 
-This branch (`python3-port`) replaces the original Python 2 code with a
+This fork replaces the original Python 2 code with a
 Python 3 rewrite. It targets **Python 3.11 or newer**: Raspberry Pi OS
 Bookworm ships 3.11, and the code is written to keep working under Python
 3.14's new multiprocessing default. The folder layout, the entry points
