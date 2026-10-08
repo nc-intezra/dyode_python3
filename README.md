@@ -4,7 +4,7 @@ A DIY, low-cost data diode for ICS. This has been migrated to python3 and has be
 
 This project aims at creating a working data diode for a fraction of the price of the commercial ones.
 
-This project includes two versions of DYODE :
+There are two versions of hardware targeted by DYODE:
 * DYODE full : a 19" rack-sized data diode
 
 ![dyodev1 picture](https://github.com/wavestone-cdt/dyode/blob/master/DYODE%20v1%20(full)/dyodev1.jpg)
