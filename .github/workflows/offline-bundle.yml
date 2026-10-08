@@ -1,0 +1,115 @@
+# Builds the offline install bundle on GitHub's machines, which have the
+# internet access an air-gapped DYODE box does not, and commits it back to
+# the branch:
+#
+#   packaging/wheels/   Python packages, Python 3.11-3.14, x86_64 + aarch64
+#   packaging/debs/     udpcast + Python venv support, Ubuntu 22.04/24.04/
+#                       26.04, amd64 + arm64 (arm64 built on native ARM
+#                       runners, so no emulation is involved)
+#
+# Runs when the requirements or the build scripts change, or by hand from
+# the Actions tab ("Run workflow").  Its own commit does not re-trigger it.
+name: Offline install bundle
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "**/requirements.txt"
+      - "tools/build_wheelhouse.sh"
+      - "tools/build_debs.sh"
+      - ".github/workflows/offline-bundle.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: offline-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheels:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheelhouse
+        run: tools/build_wheelhouse.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: packaging/wheels
+          if-no-files-found: error
+
+  debs:
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["22.04", "24.04", "26.04"]
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download packages for Ubuntu ${{ matrix.release }} ${{ matrix.arch }}
+        env:
+          RELEASES: ${{ matrix.release }}
+          ARCHES: ${{ matrix.arch }}
+        run: tools/build_debs.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.release }}-${{ matrix.arch }}
+          path: packaging/debs
+          if-no-files-found: error
+
+  commit:
+    needs: [wheels, debs]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Replace the bundle with the fresh build
+        run: rm -rf packaging/wheels packaging/debs
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: packaging/wheels
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debs-*
+          path: packaging/debs
+          merge-multiple: true
+      - name: Verify every target installs offline
+        run: tools/build_wheelhouse.sh --verify
+      - name: Verify .deb checksums
+        run: |
+          for d in packaging/debs/ubuntu-*/*/; do
+            (cd "$d" && sha256sum --quiet -c SHA256SUMS) && echo "ok  $d"
+          done
+      - name: Summary
+        run: |
+          {
+            echo "### Offline bundle"
+            echo
+            echo "| part | files | size |"
+            echo "|---|---|---|"
+            echo "| wheels | $(ls packaging/wheels/*.whl | wc -l) | $(du -sh packaging/wheels | cut -f1) |"
+            for d in packaging/debs/ubuntu-*/*/; do
+              echo "| ${d#packaging/debs/} | $(ls "$d"*.deb | wc -l) | $(du -sh "$d" | cut -f1) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit the bundle
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A packaging/wheels packaging/debs
+          if git diff --cached --quiet; then
+            echo "bundle unchanged"
+          else
+            git commit -m "Rebuild offline install bundle" \
+                       -m "Built by ${{ github.workflow }} run ${{ github.run_id }}."
+            git push
+          fi

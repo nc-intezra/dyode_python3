@@ -11,11 +11,19 @@ DYODE is composed of two hardware types:
 ## Software setup
 DYODE is developed in Python and heavily relies on open-source libraries.
 
-First of all, you'll need to install [udpcast](https://www.udpcast.linux.lu/), which is the tool used to transfer files through the diode.
+From the top of the repository, run the installer. It installs
+[udpcast](https://www.udpcast.linux.lu/) (the tool that moves files through the
+diode), Python 3.11+ virtualenv support and DYODE's Python packages, then starts
+the setup wizard:
 
-Then, you'll require Python 3.11 or newer and the modules listed in
-`requirements.txt` (`pip install -r requirements.txt`, ideally in a venv).
-See `PYTHON3_MIGRATION.md` at the root of the repository for details.
+```bash
+sudo ./install.sh --offline   # air-gapped: uses only the files in packaging/
+sudo ./install.sh --online    # with internet access
+```
+
+With neither flag it asks. Offline installs need no network at all; the
+bundle covers Ubuntu 22.04, 24.04 and 26.04 on amd64 and arm64. See
+`PYTHON3_MIGRATION.md` at the root of the repository for details.
 
 ### Configuration file
 Configuration is based on a YAML file, which must be copied to both input and output diodes.

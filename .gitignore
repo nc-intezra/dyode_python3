@@ -21,6 +21,8 @@ parts/
 sdist/
 var/
 wheels/
+# ...except the offline install bundle, which is shipped on purpose
+!packaging/wheels/
 *.egg-info/
 .installed.cfg
 *.egg

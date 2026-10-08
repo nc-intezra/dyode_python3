@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+# DYODE installer: OS packages, a Python virtualenv, and DYODE's Python
+# packages -- from the internet, or offline from the files in packaging/.
+#
+#   sudo ./install.sh                     asks everything it needs
+#   sudo ./install.sh --offline           bundled files only, no network
+#   sudo ./install.sh --online            apt and PyPI, as usual
+#   sudo ./install.sh --offline --variant v2 --side out --yes --no-wizard
+#
+# Options:
+#   --offline | --online      where packages come from (asked if omitted)
+#   --variant v1|v2           DYODE v1 (full) or v2 (light)  (asked if omitted)
+#   --side in|out             which box; needed for v2       (asked if omitted)
+#   --python PATH             use this interpreter (3.11+) for the virtualenv
+#   --skip-os-packages        do not install udpcast / python venv support
+#   --no-wizard               do not start the setup wizard afterwards
+#   -y, --yes                 do not ask for confirmation
+#   --dry-run                 show what would be done, change nothing
+#   -h, --help                this text
+#
+# The virtualenv is created on THIS machine, from this machine's Python.
+# Copying a venv/ between machines or folders is not supported: a venv
+# records the absolute path it was created at and the exact interpreter.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WHEELS="$ROOT/packaging/wheels"
+DEBS="$ROOT/packaging/debs"
+OS_RELEASE="${DYODE_OS_RELEASE:-/etc/os-release}"
+
+MODE="" VARIANT="" SIDE="" PYTHON=""
+ASSUME_YES=0 RUN_WIZARD=1 SKIP_OS=0 DRY_RUN=0
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n== %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf '\nerror: %s\n' "$*" >&2; exit 1; }
+run()  {
+  if [ "$DRY_RUN" -eq 1 ]; then printf '   would run: %s\n' "$*"; else "$@"; fi
+}
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+interactive() { [ -t 0 ] && [ -t 1 ]; }
+
+# ---------------------------------------------------------------- arguments
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --offline) MODE=offline ;;
+    --online)  MODE=online ;;
+    --mode)    MODE="${2:-}"; shift ;;
+    --mode=*)  MODE="${1#*=}" ;;
+    --variant) VARIANT="${2:-}"; shift ;;
+    --variant=*) VARIANT="${1#*=}" ;;
+    --side)    SIDE="${2:-}"; shift ;;
+    --side=*)  SIDE="${1#*=}" ;;
+    --python)  PYTHON="${2:-}"; shift ;;
+    --python=*) PYTHON="${1#*=}" ;;
+    --skip-os-packages) SKIP_OS=1 ;;
+    --no-wizard) RUN_WIZARD=0 ;;
+    -y|--yes)  ASSUME_YES=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "unknown option: $1" ;;
+  esac
+  shift
+done
+case "$MODE"    in ""|offline|online) ;; *) die "--mode must be offline or online" ;; esac
+case "$VARIANT" in ""|v1|v2) ;; *) die "--variant must be v1 or v2" ;; esac
+case "$SIDE"    in ""|in|out) ;; *) die "--side must be in or out" ;; esac
+
+# Numbered choice on the terminal.  Prints the chosen number (1-based).
+choose() {                       # choose "question" default "opt1" "opt2" ...
+  local question="$1" default="$2" answer i; shift 2
+  say "" >&2; say "$question" >&2
+  i=1; for opt in "$@"; do say "  $i) $opt" >&2; i=$((i + 1)); done
+  while true; do
+    printf 'Choice [%s]: ' "$default" >&2
+    read -r answer || die "input ended"
+    answer="${answer:-$default}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le $# ]; then
+      echo "$answer"; return
+    fi
+    say "Please enter a number from 1 to $#." >&2
+  done
+}
+
+# ---------------------------------------------------------------- the host
+OS_ID="" OS_VER=""
+if [ -r "$OS_RELEASE" ]; then
+  OS_ID="$(. "$OS_RELEASE" && echo "${ID:-}")"
+  OS_VER="$(. "$OS_RELEASE" && echo "${VERSION_ID:-}")"
+fi
+ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
+if [ -z "$ARCH" ]; then
+  case "$(uname -m)" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; *) ARCH="$(uname -m)" ;; esac
+fi
+DEB_DIR="$DEBS/ubuntu-$OS_VER/$ARCH"
+
+wheel_count() { ls "$WHEELS"/*.whl 2>/dev/null | wc -l | tr -d ' '; }
+debs_present() { [ "$OS_ID" = ubuntu ] && ls "$DEB_DIR"/*.deb >/dev/null 2>&1; }
+internet() {
+  getent hosts pypi.org >/dev/null 2>&1 &&
+    timeout 5 bash -c 'exec 3<>/dev/tcp/pypi.org/443' 2>/dev/null
+}
+
+py_ok() {                        # a Python of at least 3.11
+  "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null
+}
+py_ver() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])'; }
+venv_ok() {                      # Debian strips ensurepip without pythonX.Y-venv
+  "$1" -c 'import ensurepip, venv' 2>/dev/null
+}
+find_python() {
+  local c p
+  if [ -n "$PYTHON" ]; then
+    py_ok "$PYTHON" && { echo "$PYTHON"; return 0; }
+    die "--python $PYTHON is not Python 3.11 or newer"
+  fi
+  # The distribution's own python3 first: it is what python3-venv targets.
+  for c in python3 python3.14 python3.13 python3.12 python3.11; do
+    p="$(command -v "$c" 2>/dev/null)" || continue
+    py_ok "$p" && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- questions
+say "DYODE installer"
+say "  host:    ${OS_ID:-unknown} ${OS_VER:-?} ($ARCH)"
+say "  bundle:  $(wheel_count) Python wheel(s); $(debs_present && echo "OS packages for Ubuntu $OS_VER $ARCH" || echo "no OS packages for this system")"
+
+if [ -z "$MODE" ]; then
+  interactive || die "choose --offline or --online (no terminal to ask on)"
+  if [ "$(wheel_count)" -gt 0 ] && ! internet; then default=1; net="not reachable"
+  else default=2; net="reachable"; fi
+  say "  internet: $net"
+  n="$(choose "Where should packages come from?" "$default" \
+        "Offline - only the files bundled in packaging/ (no network needed)" \
+        "Online  - apt and PyPI over the internet")"
+  [ "$n" = 1 ] && MODE=offline || MODE=online
+fi
+
+if [ -z "$VARIANT" ]; then
+  interactive || die "choose --variant v1 or v2 (no terminal to ask on)"
+  n="$(choose "Which DYODE is this box?" 1 \
+        "DYODE v1 (full)  - Ethernet + optical link: files, Modbus, screen" \
+        "DYODE v2 (light) - optocoupler serial link: Modbus only")"
+  [ "$n" = 1 ] && VARIANT=v1 || VARIANT=v2
+fi
+
+# v1 keeps both sides in one folder; v2 has one folder per side.
+if [ "$VARIANT" = v2 ] && [ -z "$SIDE" ]; then
+  interactive || die "v2 needs --side in or out (no terminal to ask on)"
+  n="$(choose "Which side of the diode is this box?" 1 \
+        "Input (sending)" "Output (receiving)")"
+  [ "$n" = 1 ] && SIDE=in || SIDE=out
+fi
+
+if [ "$VARIANT" = v1 ]; then TARGET="$ROOT/DYODE_v1_full"
+else TARGET="$ROOT/DYODE_v2_light/$SIDE"; fi
+VENV="$TARGET/venv"
+REQ="$TARGET/requirements.txt"
+[ -f "$REQ" ] || die "missing $REQ"
+
+# ---------------------------------------------------------------- plan
+PY="$(find_python || true)"
+PKGS=()
+if [ "$SKIP_OS" -eq 0 ]; then
+  if [ "$VARIANT" = v1 ] && ! command -v udp-sender >/dev/null 2>&1; then
+    PKGS+=(udpcast)
+  fi
+  if [ -z "$PY" ]; then
+    case "$OS_ID $OS_VER" in
+      # 22.04's python3 is 3.10; Ubuntu's universe repository has 3.11.
+      "ubuntu 22.04") PKGS+=(python3.11 python3.11-venv) ;;
+      *) die "no Python 3.11 or newer found; install one, or pass --python" ;;
+    esac
+  elif ! venv_ok "$PY"; then
+    PKGS+=("python$(py_ver "$PY")-venv")
+  fi
+elif [ -z "$PY" ]; then
+  die "no Python 3.11 or newer found (and --skip-os-packages was given)"
+fi
+
+say ""
+say "Plan ($MODE install of DYODE $VARIANT${SIDE:+, $SIDE side}):"
+if [ "${#PKGS[@]}" -gt 0 ]; then
+  say "  OS packages:  ${PKGS[*]}  (from $([ "$MODE" = offline ] && echo "${DEB_DIR#"$ROOT"/}" || echo apt))"
+else
+  say "  OS packages:  nothing needed"
+fi
+say "  Python:       ${PY:-python3.11 (after installing it)}"
+say "  virtualenv:   ${VENV#"$ROOT"/}"
+say "  packages:     ${REQ#"$ROOT"/}  (from $([ "$MODE" = offline ] && echo "${WHEELS#"$ROOT"/}" || echo PyPI))"
+[ "$RUN_WIZARD" -eq 1 ] && say "  then:         the setup wizard"
+
+if [ "$ASSUME_YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+  interactive || die "pass --yes to proceed without a terminal"
+  printf '\nProceed? [Y/n] '
+  read -r answer || die "input ended"
+  case "${answer:-y}" in y|Y|yes|YES) ;; *) say "Nothing changed."; exit 1 ;; esac
+fi
+
+if [ "${#PKGS[@]}" -gt 0 ] && [ "$(id -u)" -ne 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+  die "installing ${PKGS[*]} needs root: run with sudo (or --skip-os-packages)"
+fi
+
+check_sums() {                   # catch files damaged on the way across
+  local dir="$1"
+  [ -f "$dir/SHA256SUMS" ] || die "no SHA256SUMS in ${dir#"$ROOT"/}; the bundle is incomplete"
+  (cd "$dir" && sha256sum --quiet -c SHA256SUMS) ||
+    die "files in ${dir#"$ROOT"/} do not match SHA256SUMS; copy the bundle again"
+}
+
+# Offline: check the whole bundle BEFORE changing anything, so a damaged or
+# incomplete copy stops the install instead of leaving it half done.
+if [ "$MODE" = offline ]; then
+  step "checking the offline bundle"
+  [ "$(wheel_count)" -gt 0 ] || die "no wheels in ${WHEELS#"$ROOT"/}; build them with tools/build_wheelhouse.sh on a machine with internet access"
+  check_sums "$WHEELS"
+  say "   $(wheel_count) wheels intact"
+  if [ "${#PKGS[@]}" -gt 0 ]; then
+    [ "$OS_ID" = ubuntu ] || die "offline OS packages are bundled for Ubuntu only; this is ${OS_ID:-unknown}. Install ${PKGS[*]} by hand, then rerun with --skip-os-packages"
+    debs_present || die "no bundled packages for Ubuntu $OS_VER $ARCH in ${DEB_DIR#"$ROOT"/} (bundled: $(ls "$DEBS" 2>/dev/null | tr '\n' ' '))"
+    check_sums "$DEB_DIR"
+    say "   $(ls "$DEB_DIR"/*.deb | wc -l | tr -d ' ') OS packages for Ubuntu $OS_VER $ARCH intact"
+  fi
+fi
+
+# ---------------------------------------------------------------- OS packages
+# Offline, apt is pointed at a private repository built from the bundled
+# .deb files and nothing else.  apt then resolves dependencies itself,
+# installs only what is actually missing, never downgrades a package the
+# host already has newer, and cannot reach the network.
+install_offline_debs() {          # bundle already checked above
+  local tmp; tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+  mkdir -p "$tmp/repo" "$tmp/lists/partial" "$tmp/parts"
+  cp "$DEB_DIR"/*.deb "$tmp/repo/"
+  chmod 755 "$tmp" "$tmp/repo"; chmod 644 "$tmp/repo"/*.deb
+  # A Packages index from the .deb files themselves, so it can never
+  # disagree with them.  Only dpkg-deb is needed, which every host has.
+  for deb in "$tmp/repo"/*.deb; do
+    dpkg-deb -f "$deb"
+    printf 'Filename: ./%s\nSize: %s\nSHA256: %s\n\n' "$(basename "$deb")" \
+      "$(stat -c %s "$deb")" "$(sha256sum "$deb" | cut -d' ' -f1)"
+  done > "$tmp/repo/Packages"
+  echo "deb [trusted=yes] file:$tmp/repo ./" > "$tmp/local.list"
+  local opts=(-o "Dir::Etc::SourceList=$tmp/local.list"
+              -o "Dir::Etc::SourceParts=$tmp/parts"
+              -o "Dir::State::Lists=$tmp/lists"
+              -o "Dir::Cache::pkgcache=" -o "Dir::Cache::srcpkgcache="
+              -o "APT::Sandbox::User=root" -o "Acquire::Languages=none")
+  apt-get "${opts[@]}" -qq update
+  DEBIAN_FRONTEND=noninteractive apt-get "${opts[@]}" install -y \
+    --no-install-recommends "${PKGS[@]}" ||
+    die "the bundled packages for Ubuntu $OS_VER $ARCH cannot satisfy ${PKGS[*]} on this host (see apt's message above). Rebuild them with tools/build_debs.sh, or install the missing packages by hand and rerun with --skip-os-packages"
+}
+
+if [ "${#PKGS[@]}" -gt 0 ]; then
+  step "OS packages: ${PKGS[*]}"
+  if [ "$MODE" = offline ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      say "   would install from ${DEB_DIR#"$ROOT"/} via a private local apt repository"
+    else
+      install_offline_debs
+    fi
+  else
+    run apt-get update
+    DEBIAN_FRONTEND=noninteractive run apt-get install -y --no-install-recommends "${PKGS[@]}"
+  fi
+  if [ "$DRY_RUN" -eq 0 ]; then
+    PY="$(find_python)" || die "still no Python 3.11 or newer after installing ${PKGS[*]}"
+    venv_ok "$PY" || die "$PY still cannot create virtualenvs"
+  fi
+fi
+
+# ---------------------------------------------------------------- virtualenv
+step "virtualenv ${VENV#"$ROOT"/} ($PY)"
+reuse=0
+if [ -x "$VENV/bin/python" ] && [ -n "$PY" ] &&
+   [ "$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" = "$(py_ver "$PY")" ]; then
+  # Python 3.11+ records the path the venv was created at.  A venv carried
+  # over from another folder or revision is rebuilt, not trusted.
+  made_at="$(sed -n 's/^command = .* -m venv \(.*\)$/\1/p' "$VENV/pyvenv.cfg" 2>/dev/null)"
+  if [ -z "$made_at" ] || [ "$made_at" = "$VENV" ]; then reuse=1; fi
+fi
+if [ "$reuse" -eq 1 ]; then
+  say "   reusing the existing virtualenv"
+else
+  if [ -e "$VENV" ]; then
+    say "   replacing an existing virtualenv made elsewhere or with another Python"
+    run rm -rf "$VENV"
+  fi
+  run "$PY" -m venv "$VENV"
+fi
+
+# ---------------------------------------------------------------- packages
+step "Python packages from ${REQ#"$ROOT"/}"
+PIP=("$VENV/bin/python" -m pip --disable-pip-version-check)
+if [ "$MODE" = offline ]; then
+  if ! run "${PIP[@]}" install --no-index --find-links "$WHEELS" -r "$REQ"; then
+    die "the bundled wheels do not cover this system (Python $(py_ver "$PY"), $ARCH); see packaging/wheels/MANIFEST.txt and rebuild with tools/build_wheelhouse.sh"
+  fi
+else
+  run "${PIP[@]}" install -r "$REQ"
+fi
+
+# ---------------------------------------------------------------- verify
+step "checking the installation"
+if [ "$DRY_RUN" -eq 1 ]; then
+  say "   would import every package in ${REQ#"$ROOT"/}"
+else
+  "$VENV/bin/python" - "$REQ" <<'PYEOF' || die "installed packages failed to import"
+import importlib, importlib.metadata as md, re, sys
+modules = {"pyyaml": "yaml", "pymodbus": "pymodbus",
+           "inotify-simple": "inotify_simple", "inotify_simple": "inotify_simple",
+           "pyserial": "serial"}
+for line in open(sys.argv[1]):
+    line = line.split("#")[0].strip()
+    if not line:
+        continue
+    name = re.split(r"[\s<>=!~;\[]", line)[0]
+    module = modules.get(name.lower(), name.lower().replace("-", "_"))
+    importlib.import_module(module)
+    print("   ok  %-16s %s" % (name, md.version(name)))
+PYEOF
+  if [ "$VARIANT" = v1 ] && ! command -v udp-sender >/dev/null 2>&1; then
+    warn "udp-sender is not installed; folder transfers will not work until udpcast is"
+  fi
+fi
+
+say ""
+say "Installed: DYODE $VARIANT${SIDE:+ ($SIDE side)}, $MODE, in ${TARGET#"$ROOT"/}"
+
+# ---------------------------------------------------------------- wizard
+if [ "$RUN_WIZARD" -eq 1 ]; then
+  args=(--variant "$VARIANT" --install-mode "$MODE")
+  [ -n "$SIDE" ] && args+=(--side "$SIDE")
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say "   would run: $VENV/bin/python dyode_setup.py ${args[*]}"
+  elif interactive; then
+    step "setup wizard"
+    exec "$VENV/bin/python" "$ROOT/dyode_setup.py" "${args[@]}"
+  else
+    say "Next: $VENV/bin/python $ROOT/dyode_setup.py ${args[*]}"
+  fi
+fi

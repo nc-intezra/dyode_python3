@@ -273,7 +273,8 @@ class WizardFlowTests(unittest.TestCase):
             os.makedirs(os.path.join(self.repo, sub))
         self.net = fake_sysfs({"eth0": ("b8:27:eb:00:00:01", True, False),
                                "eth1": ("b8:27:eb:00:00:02", False, False)})
-        self.args = wizard.parse_args(["--repo", self.repo, "--sys-root", self.net])
+        self.args = wizard.parse_args(["--repo", self.repo, "--sys-root", self.net,
+                                  "--install-mode", "offline"])
 
     def run_wizard(self, script, args=None):
         ui = ScriptedUi(script)
@@ -301,6 +302,56 @@ class WizardFlowTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(
             self.repo, "DYODE_v1_full", "dyode-in.service")))
 
+    V1_INPUT_SCRIPT = [
+        ("choose", "Start a new"), ("text", "Lab diode"),
+        ("choose", "eth0"), ("text", "10.0.1.1"),
+        ("text", "10.0.1.2"), ("text", ""), ("text", "eth1"),
+        ("choose", "Add"), ("choose", "modbus"), ("text", "PLC one"),
+        ("text", "192.168.1.10"), ("text", "502"), ("text", "0-100"), ("text", "0-10"),
+        ("choose", "Done"), ("confirm", True)]
+
+    def args_without_mode(self):
+        return wizard.parse_args(["--repo", self.repo, "--sys-root", self.net])
+
+    def test_install_question_asked_when_nothing_is_installed(self):
+        ui, plan = self.run_wizard(
+            [("choose", "v1"), ("choose", "Input"), ("choose", "Offline")]
+            + self.V1_INPUT_SCRIPT, args=self.args_without_mode())
+        self.assertEqual(plan.install_mode, "offline")
+        self.assertIn("Installing software", [s[1] for s in ui.seen])
+        steps = "\n".join(core.next_steps(plan))
+        self.assertIn("sudo ./install.sh --offline --variant v1", steps)
+
+    def test_install_question_online_answer(self):
+        _, plan = self.run_wizard(
+            [("choose", "v1"), ("choose", "Input"), ("choose", "Online")]
+            + self.V1_INPUT_SCRIPT, args=self.args_without_mode())
+        self.assertEqual(plan.install_mode, "online")
+        self.assertIn("sudo ./install.sh --online --variant v1",
+                      "\n".join(core.next_steps(plan)))
+
+    def test_install_question_skipped_once_installed(self):
+        venv_bin = os.path.join(self.repo, "DYODE_v1_full", "venv", "bin")
+        os.makedirs(venv_bin)
+        python = os.path.join(venv_bin, "python")
+        with open(python, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(python, 0o755)
+        ui, plan = self.run_wizard(
+            [("choose", "v1"), ("choose", "Input")] + self.V1_INPUT_SCRIPT,
+            args=self.args_without_mode())
+        self.assertIsNone(plan.install_mode)
+        self.assertNotIn("Installing software", [s[1] for s in ui.seen])
+
+    def test_install_command_shapes(self):
+        self.assertEqual(core.install_command("offline", "v2", "out"),
+                         "sudo ./install.sh --offline --variant v2 --side out")
+        self.assertEqual(core.install_command("online", "v1", "in"),
+                         "sudo ./install.sh --online --variant v1")
+        # No choice made: leave it to install.sh to ask.
+        self.assertEqual(core.install_command(None, "v1", "in"),
+                         "sudo ./install.sh --variant v1")
+
     def test_second_box_imports_first_box_config(self):
         _, first = self.run_wizard([
             ("choose", "v1"), ("choose", "Input"),
@@ -313,6 +364,7 @@ class WizardFlowTests(unittest.TestCase):
         wizard.review_and_apply(ScriptedUi([("confirm", True)]), first)
 
         args = wizard.parse_args(["--repo", self.repo, "--sys-root", self.net,
+                                  "--install-mode", "offline",
                                   "--import-config", first.config_path])
         _, second = self.run_wizard([
             ("choose", "v1"), ("choose", "Output"),
@@ -327,6 +379,7 @@ class WizardFlowTests(unittest.TestCase):
         dev = tempfile.mkdtemp()
         open(os.path.join(dev, "serial0"), "w").close()
         args = wizard.parse_args(["--repo", self.repo, "--sys-root", self.net,
+                                  "--install-mode", "offline",
                                   "--dev-root", dev])
         _, plan = self.run_wizard([
             ("choose", "v2"), ("choose", "Output"),
@@ -381,6 +434,7 @@ class FrontEndTests(unittest.TestCase):
 
     def run_plain(self, answers, extra=()):
         cmd = [sys.executable, os.path.join(_setup.REPO, "dyode_setup.py"), "--plain",
+               "--install-mode", "offline",
                "--repo", self.repo, "--sys-root", self.net] + list(extra)
         return subprocess.run(cmd, input="\n".join(answers) + "\n", text=True,
                               capture_output=True, timeout=60)

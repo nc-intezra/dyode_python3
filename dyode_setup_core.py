@@ -484,10 +484,12 @@ class Plan:
     """What the wizard decided to do, so it can be shown before anything is
     written and then applied in one step."""
 
-    def __init__(self, model, side, workdir):
+    def __init__(self, model, side, workdir, install_mode=None):
         self.model = model
         self.side = side
         self.workdir = workdir
+        # "offline", "online", or None when the box is already installed.
+        self.install_mode = install_mode
         self.config_path = os.path.join(workdir, "config.yaml")
         self.write_unit = False
         self.unit_path = None
@@ -517,20 +519,36 @@ class Plan:
         return self.created
 
 
+def venv_ready(workdir):
+    """True when this folder already has a working virtualenv."""
+    python = os.path.join(workdir, "venv", "bin", "python")
+    return os.path.isfile(python) and os.access(python, os.X_OK)
+
+
+def install_command(mode, variant, side):
+    """The install.sh line for this box.  Offline uses only the files
+    bundled in packaging/; online uses apt and PyPI."""
+    parts = ["sudo ./install.sh"]
+    if mode in ("offline", "online"):
+        parts.append("--" + mode)        # otherwise install.sh asks
+    parts += ["--variant", variant]
+    if variant == "v2":
+        parts += ["--side", side]
+    return " ".join(parts)
+
+
 def next_steps(plan):
     """Instructions shown after a successful run."""
     model, side, workdir = plan.model, plan.side, plan.workdir
     local_ip = model.in_ip if side == "in" else model.out_ip
     iface = model.in_if if side == "in" else model.out_if
     steps = []
-    if not os.path.isdir(os.path.join(workdir, "venv")):
-        steps.append("Install the dependencies:\n"
-                     "    cd %s\n"
-                     "    python3 -m venv venv && venv/bin/pip install -r requirements.txt"
-                     % _shell_quote(workdir))
-    if model.variant == "v1":
-        steps.append("Install udpcast if you use folder modules:\n"
-                     "    sudo apt install udpcast")
+    needs_udpcast = model.variant == "v1" and not shutil.which("udp-sender")
+    if not venv_ready(workdir) or needs_udpcast:
+        steps.append("Install the software%s:\n    cd %s\n    %s"
+                     % (" (including udpcast)" if needs_udpcast else "",
+                        _shell_quote(REPO_ROOT),
+                        install_command(plan.install_mode, model.variant, side)))
     steps.append("Give the diode interface its address (make it permanent in your\n"
                  "network configuration; this command only lasts until reboot):\n"
                  "    sudo ip addr add %s/24 dev %s && sudo ip link set %s up"

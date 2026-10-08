@@ -51,14 +51,92 @@ points at a checkout elsewhere.
 
 ## Installing
 
-DYODE_v1_full, on both boxes:
+`install.sh` at the top of the repository installs everything a box needs,
+either from the internet or entirely offline from files shipped in the repo:
+
+```bash
+sudo ./install.sh                  # asks: offline or online, v1 or v2, side
+sudo ./install.sh --offline        # only the bundled files; no network at all
+sudo ./install.sh --online         # apt and PyPI, as usual
+sudo ./install.sh --offline --variant v2 --side out --yes   # unattended
+```
+
+It installs `udpcast` (v1 only) and Python virtualenv support from the OS,
+builds a virtualenv **on this machine** in the variant's folder, installs the
+Python packages into it, checks they import, and then starts the setup
+wizard (`--no-wizard` to skip it). Run `./install.sh --help` for all options.
+
+**Do not copy `venv/` between machines or revisions.** A virtualenv records
+the absolute path it was created at and the exact interpreter that made it.
+It happens to keep working when the path and Python never change, and breaks
+confusingly when either does. `install.sh` detects a venv carried over from
+another folder (Python 3.11+ records where it was made) and rebuilds it.
+
+### Offline installs
+
+The bundle lives in `packaging/`:
+
+| Path | Contents |
+|---|---|
+| `packaging/wheels/` | every Python package, for Python 3.11–3.14 on x86_64 and aarch64 |
+| `packaging/debs/ubuntu-<release>/<arch>/` | `udpcast` and venv support for Ubuntu 22.04, 24.04 and 26.04, amd64 and arm64 |
+
+Each folder carries a `SHA256SUMS`. `install.sh --offline` checks the whole
+bundle **before changing anything**, so a copy damaged on its way across the
+air gap stops the install instead of leaving it half done.
+
+The bundled `.deb` files are installed through a private, local-only apt
+repository built from those files at install time. apt resolves the
+dependencies itself, installs only what the host is actually missing, never
+downgrades a package the host already has newer, and cannot reach the
+network. pip runs with `--no-index`, so it cannot either.
+
+Per release:
+
+| Ubuntu | Python used | OS packages bundled |
+|---|---|---|
+| 22.04 | 3.11 | `udpcast python3.11 python3.11-venv` — 22.04's own `python3` is 3.10, older than DYODE supports, so 3.11 comes from Ubuntu's universe repository |
+| 24.04 | 3.12 | `udpcast python3-venv` |
+| 26.04 | 3.14 | `udpcast python3-venv` |
+
+Only Ubuntu has bundled OS packages. On another system (Raspberry Pi OS, for
+instance), install `udpcast` (v1) and `python3-venv` by hand, then run
+`install.sh --offline --skip-os-packages`; the Python side still installs
+offline.
+
+### Refreshing the bundle
+
+The bundle is built on a machine **with** internet access:
+
+```bash
+tools/build_wheelhouse.sh          # packaging/wheels/, then verifies it
+tools/build_debs.sh                # packaging/debs/, needs Docker or Podman
+tools/build_wheelhouse.sh --verify # check an existing wheelhouse
+```
+
+`build_wheelhouse.sh` finishes by proving that every `requirements.txt` can be
+installed for every Python version and CPU type from the bundled files alone,
+using pip with the network switched off. `build_debs.sh` resolves each
+release's packages inside a clean `ubuntu:<release>` container, so apt — not
+a hand-written list — decides the dependencies.
+
+The **Offline install bundle** GitHub Actions workflow
+(`.github/workflows/offline-bundle.yml`) runs both on GitHub's machines,
+arm64 on native ARM runners, verifies the result and commits it back to the
+branch. It runs automatically when a `requirements.txt` or a build script
+changes, and can be started by hand from the repository's Actions tab.
+**Rebuild the bundle whenever a requirement changes**: the test suite fails
+if the wheelhouse no longer covers every requirement on every target.
+
+### By hand
+
+The steps `install.sh` performs, for a system it does not cover:
 
 ```bash
 sudo apt install python3-venv udpcast iproute2
-cd "DYODE_v1_full"
+cd DYODE_v1_full
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
-# then either run ../dyode_setup.py, or:
-cp config.example.yaml config.yaml    # edit, then copy the same file to both boxes
+# offline: venv/bin/pip install --no-index --find-links ../packaging/wheels -r requirements.txt
 ```
 
 DYODE_v2_light: the same, in `DYODE_v2_light/in` on the input Pi and in
@@ -502,3 +580,7 @@ Repository root:
 | `dyode_logs.py` | weekly log archiving (`--archive`) and a reader (`--stats`) |
 | `packaging/logrotate/dyode-transfer` | install as `/etc/logrotate.d/dyode-transfer` |
 | `packaging/systemd/dyode-log-archive.{service,timer}` | weekly archiving timer |
+| `install.sh` | installer: OS packages, virtualenv, Python packages; `--offline` or `--online` |
+| `packaging/wheels/`, `packaging/debs/` | the offline install bundle |
+| `tools/build_wheelhouse.sh`, `tools/build_debs.sh` | rebuild the bundle on a machine with internet access |
+| `.github/workflows/offline-bundle.yml` | rebuilds the bundle on GitHub and commits it |

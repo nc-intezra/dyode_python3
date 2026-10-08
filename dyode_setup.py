@@ -250,6 +250,16 @@ def run_wizard(ui, args):
         [("Input (sending)", "connected to the sensitive network, sends data out"),
          ("Output (receiving)", "connected to the less trusted network, serves data")])]
 
+    workdir = core.target_dir(variant, side, args.repo)
+    install_mode = args.install_mode
+    if install_mode is None and not core.venv_ready(workdir):
+        install_mode = ["offline", "online"][ui.choose(
+            "Installing software",
+            ["DYODE's software is not installed in this folder yet.",
+             "Where should it come from? The command to run is shown at the end."],
+            [("Offline", "only the files bundled in packaging/ - no internet needed"),
+             ("Online", "apt and PyPI over the internet")])]
+
     model = _load_or_new(ui, args, variant)
 
     if variant == "v1":
@@ -259,8 +269,7 @@ def run_wizard(ui, args):
 
     _edit_modules(ui, model, variant)
 
-    workdir = core.target_dir(variant, side, args.repo)
-    plan = core.Plan(model, side, workdir)
+    plan = core.Plan(model, side, workdir, install_mode=install_mode)
     plan.unit_path = os.path.join(workdir, core.unit_name(side))
     plan.write_unit = ui.confirm("Start at boot", [
         "Generate a systemd service file for this side?",
@@ -480,6 +489,9 @@ def parse_args(argv=None):
                    help="path to the DYODE checkout (default: this folder)")
     p.add_argument("--variant", choices=["v1", "v2"], help="skip the version question")
     p.add_argument("--side", choices=["in", "out"], help="skip the side question")
+    p.add_argument("--install-mode", choices=["offline", "online"],
+                   help="where install.sh gets packages; skips that question "
+                        "(install.sh passes it when it starts the wizard)")
     p.add_argument("--import-config", metavar="FILE",
                    help="import the other box's config.yaml straight away")
     p.add_argument("--dry-run", action="store_true", help="show, but write nothing")
