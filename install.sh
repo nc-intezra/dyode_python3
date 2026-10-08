@@ -89,7 +89,7 @@ if [ -r "$OS_RELEASE" ]; then
   OS_ID="$(. "$OS_RELEASE" && echo "${ID:-}")"
   OS_VER="$(. "$OS_RELEASE" && echo "${VERSION_ID:-}")"
 fi
-ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
+ARCH="${DYODE_ARCH:-$(dpkg --print-architecture 2>/dev/null || true)}"   # override: tests
 if [ -z "$ARCH" ]; then
   case "$(uname -m)" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; *) ARCH="$(uname -m)" ;; esac
 fi
