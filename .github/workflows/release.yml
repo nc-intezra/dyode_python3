@@ -1,0 +1,72 @@
+# Publishes a GitHub Release when a version tag is pushed:
+#
+#   echo 1.1.0 > VERSION      # and add a "## [1.1.0]" section to CHANGELOG.md
+#   git commit -am "Release 1.1.0" && git tag -a v1.1.0 -m "DYODE 1.1.0"
+#   git push origin master v1.1.0
+#
+# Before publishing it checks that the tag matches VERSION and CHANGELOG.md,
+# runs the test suite, and verifies the offline bundle, so a release is never
+# cut from a tree whose bundle is incomplete or damaged.  The release carries
+# dyode-<version>.tar.gz (the whole repository, offline bundle included) and
+# its SHA-256, for carrying across an air gap.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the version
+        run: |
+          version="$(cat VERSION)"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($version)"
+            exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+
+      - name: Test
+        run: |
+          python -m pip install --quiet pyyaml
+          python -m unittest discover -s tests
+
+      - name: Verify the offline bundle
+        run: |
+          tools/build_wheelhouse.sh --verify
+          for d in packaging/debs/*/*/; do
+            (cd "$d" && sha256sum --quiet -c SHA256SUMS) && echo "ok  $d"
+          done
+
+      - name: Package
+        run: |
+          version="$(cat VERSION)"
+          name="dyode-$version"
+          git archive --format=tar.gz --prefix="$name/" -o "$name.tar.gz" HEAD
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          # This version's CHANGELOG section becomes the release notes.
+          awk -v v="[$version]" '/^## \[/ { p = index($0, v) > 0; next } p' \
+            CHANGELOG.md > notes.md
+          ls -l "$name".tar.gz*
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(cat VERSION)"
+          gh release create "$GITHUB_REF_NAME" \
+            "dyode-$version.tar.gz" "dyode-$version.tar.gz.sha256" \
+            --title "DYODE $version" --notes-file notes.md --verify-tag

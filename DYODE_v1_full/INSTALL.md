@@ -22,7 +22,8 @@ sudo ./install.sh --online    # with internet access
 ```
 
 With neither flag it asks. Offline installs need no network at all; the
-bundle covers Ubuntu 22.04, 24.04 and 26.04 on amd64 and arm64. See
+bundle covers Ubuntu 24.04 and 26.04 (amd64, arm64) and 64-bit
+Raspberry Pi OS 12 and 13. See
 `PYTHON3_MIGRATION.md` at the root of the repository for details.
 
 ### Configuration file

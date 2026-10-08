@@ -93,10 +93,13 @@ ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
 if [ -z "$ARCH" ]; then
   case "$(uname -m)" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; *) ARCH="$(uname -m)" ;; esac
 fi
-DEB_DIR="$DEBS/ubuntu-$OS_VER/$ARCH"
+DEB_DIR="$DEBS/$OS_ID-$OS_VER/$ARCH"   # e.g. ubuntu-24.04/amd64, debian-13/arm64
 
 wheel_count() { ls "$WHEELS"/*.whl 2>/dev/null | wc -l | tr -d ' '; }
-debs_present() { [ "$OS_ID" = ubuntu ] && ls "$DEB_DIR"/*.deb >/dev/null 2>&1; }
+debs_present() { [ -n "$OS_ID" ] && ls "$DEB_DIR"/*.deb >/dev/null 2>&1; }
+# What packaging/debs/ is built for (tools/build_debs.sh).  64-bit Raspberry
+# Pi OS reports itself as Debian, so the debian-* folders serve it.
+SUPPORTED="Ubuntu 24.04 and 26.04 (amd64, arm64), Raspberry Pi OS 12 bookworm and 13 trixie (64-bit)"
 internet() {
   getent hosts pypi.org >/dev/null 2>&1 &&
     timeout 5 bash -c 'exec 3<>/dev/tcp/pypi.org/443' 2>/dev/null
@@ -124,9 +127,9 @@ find_python() {
 }
 
 # ---------------------------------------------------------------- questions
-say "DYODE installer"
+say "DYODE $(cat "$ROOT/VERSION" 2>/dev/null || echo) installer"
 say "  host:    ${OS_ID:-unknown} ${OS_VER:-?} ($ARCH)"
-say "  bundle:  $(wheel_count) Python wheel(s); $(debs_present && echo "OS packages for Ubuntu $OS_VER $ARCH" || echo "no OS packages for this system")"
+say "  bundle:  $(wheel_count) Python wheel(s); $(debs_present && echo "OS packages for $OS_ID $OS_VER $ARCH" || echo "no OS packages for this system")"
 
 if [ -z "$MODE" ]; then
   interactive || die "choose --offline or --online (no terminal to ask on)"
@@ -169,11 +172,7 @@ if [ "$SKIP_OS" -eq 0 ]; then
     PKGS+=(udpcast)
   fi
   if [ -z "$PY" ]; then
-    case "$OS_ID $OS_VER" in
-      # 22.04's python3 is 3.10; Ubuntu's universe repository has 3.11.
-      "ubuntu 22.04") PKGS+=(python3.11 python3.11-venv) ;;
-      *) die "no Python 3.11 or newer found; install one, or pass --python" ;;
-    esac
+    die "no Python 3.11 or newer found (supported: $SUPPORTED); install one, or pass --python"
   elif ! venv_ok "$PY"; then
     PKGS+=("python$(py_ver "$PY")-venv")
   fi
@@ -188,7 +187,7 @@ if [ "${#PKGS[@]}" -gt 0 ]; then
 else
   say "  OS packages:  nothing needed"
 fi
-say "  Python:       ${PY:-python3.11 (after installing it)}"
+say "  Python:       $PY ($(py_ver "$PY"))"
 say "  virtualenv:   ${VENV#"$ROOT"/}"
 say "  packages:     ${REQ#"$ROOT"/}  (from $([ "$MODE" = offline ] && echo "${WHEELS#"$ROOT"/}" || echo PyPI))"
 [ "$RUN_WIZARD" -eq 1 ] && say "  then:         the setup wizard"
@@ -219,10 +218,12 @@ if [ "$MODE" = offline ]; then
   check_sums "$WHEELS"
   say "   $(wheel_count) wheels intact"
   if [ "${#PKGS[@]}" -gt 0 ]; then
-    [ "$OS_ID" = ubuntu ] || die "offline OS packages are bundled for Ubuntu only; this is ${OS_ID:-unknown}. Install ${PKGS[*]} by hand, then rerun with --skip-os-packages"
-    debs_present || die "no bundled packages for Ubuntu $OS_VER $ARCH in ${DEB_DIR#"$ROOT"/} (bundled: $(ls "$DEBS" 2>/dev/null | tr '\n' ' '))"
+    if [ "$OS_ID" = raspbian ]; then
+      die "32-bit Raspberry Pi OS is not covered by the bundle; use the 64-bit edition, or install ${PKGS[*]} by hand and rerun with --skip-os-packages"
+    fi
+    debs_present || die "no bundled OS packages for ${OS_ID:-this system} ${OS_VER} $ARCH (bundled for: $SUPPORTED). Install ${PKGS[*]} by hand, then rerun with --skip-os-packages"
     check_sums "$DEB_DIR"
-    say "   $(ls "$DEB_DIR"/*.deb | wc -l | tr -d ' ') OS packages for Ubuntu $OS_VER $ARCH intact"
+    say "   $(ls "$DEB_DIR"/*.deb | wc -l | tr -d ' ') OS packages for $OS_ID $OS_VER $ARCH intact"
   fi
 fi
 
@@ -254,7 +255,7 @@ install_offline_debs() {          # bundle already checked above
   apt-get "${opts[@]}" -qq update
   DEBIAN_FRONTEND=noninteractive apt-get "${opts[@]}" install -y \
     --no-install-recommends "${PKGS[@]}" ||
-    die "the bundled packages for Ubuntu $OS_VER $ARCH cannot satisfy ${PKGS[*]} on this host (see apt's message above). Rebuild them with tools/build_debs.sh, or install the missing packages by hand and rerun with --skip-os-packages"
+    die "the bundled packages for $OS_ID $OS_VER $ARCH cannot satisfy ${PKGS[*]} on this host (see apt's message above). Rebuild them with tools/build_debs.sh, or install the missing packages by hand and rerun with --skip-os-packages"
 }
 
 if [ "${#PKGS[@]}" -gt 0 ]; then

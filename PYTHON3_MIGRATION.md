@@ -79,7 +79,7 @@ The bundle lives in `packaging/`:
 | Path | Contents |
 |---|---|
 | `packaging/wheels/` | every Python package, for Python 3.11–3.14 on x86_64 and aarch64 |
-| `packaging/debs/ubuntu-<release>/<arch>/` | `udpcast` and venv support for Ubuntu 22.04, 24.04 and 26.04, amd64 and arm64 |
+| `packaging/debs/<os>-<release>/<arch>/` | `udpcast` and venv support for each supported system (below) |
 
 Each folder carries a `SHA256SUMS`. `install.sh --offline` checks the whole
 bundle **before changing anything**, so a copy damaged on its way across the
@@ -91,18 +91,27 @@ dependencies itself, installs only what the host is actually missing, never
 downgrades a package the host already has newer, and cannot reach the
 network. pip runs with `--no-index`, so it cannot either.
 
-Per release:
+Supported systems, each bundled with `udpcast` and `python3-venv` plus their
+dependencies:
 
-| Ubuntu | Python used | OS packages bundled |
-|---|---|---|
-| 22.04 | 3.11 | `udpcast python3.11 python3.11-venv` — 22.04's own `python3` is 3.10, older than DYODE supports, so 3.11 comes from Ubuntu's universe repository |
-| 24.04 | 3.12 | `udpcast python3-venv` |
-| 26.04 | 3.14 | `udpcast python3-venv` |
+| System | CPU | Python | Bundle folder |
+|---|---|---|---|
+| Ubuntu 24.04 LTS | amd64, arm64 | 3.12 | `ubuntu-24.04/` |
+| Ubuntu 26.04 LTS | amd64, arm64 | 3.14 | `ubuntu-26.04/` |
+| Raspberry Pi OS 12 "bookworm", 64-bit | arm64 | 3.11 | `debian-12/` |
+| Raspberry Pi OS 13 "trixie", 64-bit | arm64 | 3.13 | `debian-13/` |
 
-Only Ubuntu has bundled OS packages. On another system (Raspberry Pi OS, for
-instance), install `udpcast` (v1) and `python3-venv` by hand, then run
-`install.sh --offline --skip-os-packages`; the Python side still installs
-offline.
+64-bit Raspberry Pi OS takes Python and udpcast unchanged from Debian's arm64
+archive and identifies itself as Debian in `/etc/os-release`, so the
+`debian-*` folders serve it (and plain Debian 12/13 on arm64). The wheels
+cover Python 3.11–3.14, which spans all four.
+
+**Not supported:** Ubuntu 22.04, whose `python3` is 3.10 and whose only 3.11
+is a release candidate (`3.11.0~rc1`); and 32-bit Raspberry Pi OS (armhf),
+which uses a separate archive. On any other system, install `udpcast` (v1)
+and `python3-venv` by hand and run `install.sh --offline --skip-os-packages`;
+the Python side still installs offline if its Python is 3.11–3.14 on x86_64
+or aarch64.
 
 ### Refreshing the bundle
 

@@ -3,17 +3,21 @@
 # the branch:
 #
 #   packaging/wheels/   Python packages, Python 3.11-3.14, x86_64 + aarch64
-#   packaging/debs/     udpcast + Python venv support, Ubuntu 22.04/24.04/
-#                       26.04, amd64 + arm64 (arm64 built on native ARM
-#                       runners, so no emulation is involved)
+#   packaging/debs/     udpcast + Python venv support for Ubuntu 24.04 and
+#                       26.04 (amd64, arm64) and Raspberry Pi OS 12/13
+#                       (arm64); arm64 is built on native ARM runners, so no
+#                       emulation is involved
 #
-# Runs when the requirements or the build scripts change, or by hand from
-# the Actions tab ("Run workflow").  Its own commit does not re-trigger it.
+# Runs when the requirements or the build scripts change on a branch other
+# than master (master receives the bundle already built, through the merge),
+# or by hand from the Actions tab ("Run workflow").  Its own commit does not
+# re-trigger it.
 name: Offline install bundle
 
 on:
   workflow_dispatch:
   push:
+    branches-ignore: [master]
     paths:
       - "**/requirements.txt"
       - "tools/build_wheelhouse.sh"
@@ -47,19 +51,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        release: ["22.04", "24.04", "26.04"]
-        arch: [amd64, arm64]
-    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+        target:
+          - ubuntu-24.04/amd64
+          - ubuntu-24.04/arm64
+          - ubuntu-26.04/amd64
+          - ubuntu-26.04/arm64
+          - debian-12/arm64      # Raspberry Pi OS bookworm (64-bit)
+          - debian-13/arm64      # Raspberry Pi OS trixie (64-bit)
+    runs-on: ${{ endsWith(matrix.target, '/arm64') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Download packages for Ubuntu ${{ matrix.release }} ${{ matrix.arch }}
+      - name: Download packages for ${{ matrix.target }}
         env:
-          RELEASES: ${{ matrix.release }}
-          ARCHES: ${{ matrix.arch }}
+          TARGETS: ${{ matrix.target }}
         run: tools/build_debs.sh
+      - name: Artifact name
+        id: name
+        run: echo "name=debs-${TARGET//\//-}" >> "$GITHUB_OUTPUT"
+        env:
+          TARGET: ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: debs-${{ matrix.release }}-${{ matrix.arch }}
+          name: ${{ steps.name.outputs.name }}
           path: packaging/debs
           if-no-files-found: error
 
@@ -86,7 +99,7 @@ jobs:
         run: tools/build_wheelhouse.sh --verify
       - name: Verify .deb checksums
         run: |
-          for d in packaging/debs/ubuntu-*/*/; do
+          for d in packaging/debs/*/*/; do
             (cd "$d" && sha256sum --quiet -c SHA256SUMS) && echo "ok  $d"
           done
       - name: Summary
@@ -97,7 +110,7 @@ jobs:
             echo "| part | files | size |"
             echo "|---|---|---|"
             echo "| wheels | $(ls packaging/wheels/*.whl | wc -l) | $(du -sh packaging/wheels | cut -f1) |"
-            for d in packaging/debs/ubuntu-*/*/; do
+            for d in packaging/debs/*/*/; do
               echo "| ${d#packaging/debs/} | $(ls "$d"*.deb | wc -l) | $(du -sh "$d" | cut -f1) |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
