@@ -20,7 +20,7 @@ and how to deploy it, is in [PYTHON3_MIGRATION.md](PYTHON3_MIGRATION.md).
 To configure a box, run the setup wizard from this folder:
 
 ```bash
-python3 dyode_setup.py          # curses interface (--plain for plain text)
+bash ./install.sh
 ```
 
 It detects your network interfaces, writes the MAC addresses into `config.yaml`
