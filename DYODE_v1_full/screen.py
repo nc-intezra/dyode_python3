@@ -210,32 +210,13 @@ def make_handler(store, max_streams=8):
     return ScreenHandler
 
 
-def interface_addresses():
-    """{interface: IPv4 address} for every interface that has one (Linux)."""
-    import fcntl
-    import struct
-    found = {}
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        for _, name in socket.if_nameindex():
-            try:
-                packed = fcntl.ioctl(probe.fileno(), 0x8915,       # SIOCGIFADDR
-                                     struct.pack("256s", name[:15].encode()))
-            except OSError:
-                continue
-            found[name] = socket.inet_ntoa(packed[20:24])
-    finally:
-        probe.close()
-    return found
-
-
 def default_http_bind(cfg, addresses=None):
     """Where the viewer page listens when http_bind is not set: the first
     address that is neither loopback nor on the diode NIC, i.e. the IT-side
     network the viewers are on.  0.0.0.0 (with a warning) if none is found."""
     net = cfg.get("network", {})
     try:
-        addresses = interface_addresses() if addresses is None else addresses
+        addresses = common.interface_addresses() if addresses is None else addresses
     except (OSError, ImportError, AttributeError):
         addresses = {}
     for name in sorted(addresses):

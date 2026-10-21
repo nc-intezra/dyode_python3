@@ -9,14 +9,31 @@
 #                       (arm64); arm64 is built on native ARM runners, so no
 #                       emulation is involved
 #
-# Runs when the requirements or the build scripts change on a branch other
-# than master (master receives the bundle already built, through the merge),
-# or by hand from the Actions tab ("Run workflow").  Its own commit does not
-# re-trigger it.
+# and records when, in packaging/BUILD-INFO (install.sh warns when a bundle
+# is more than 90 days old).
+#
+# Three ways it runs (the "mode"):
+#   commit  when the requirements or build scripts change on a branch other
+#           than master (master receives the bundle through the merge), or by
+#           hand from the Actions tab: commits the fresh bundle to the branch.
+#           Its own commit does not re-trigger it.
+#   pr      every Monday: rebuilds from master and, if any package changed
+#           (security updates), opens a pull request, so fixes do not wait for
+#           the next feature release.
+#   check   called by the release workflow: fails if the committed bundle is
+#           not what a build today produces, so a release never ships a stale
+#           bundle.  Merge the latest refresh PR, then release again.
 name: Offline install bundle
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      mode:
+        type: string
+        default: check
+  schedule:
+    - cron: "17 4 * * 1"           # Mondays 04:17 UTC
   push:
     branches-ignore: [master]
     paths:
@@ -27,6 +44,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: offline-bundle-${{ github.ref }}
@@ -80,6 +98,9 @@ jobs:
   commit:
     needs: [wheels, debs]
     runs-on: ubuntu-24.04
+    env:
+      MODE: ${{ inputs.mode || (github.event_name == 'schedule' && 'pr') || 'commit' }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -115,15 +136,79 @@ jobs:
               echo "| ${d#packaging/debs/} | $(ls "$d"*.deb | wc -l) | $(du -sh "$d" | cut -f1) |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Commit the bundle
+      - name: Compare with the committed bundle
+        id: diff
+        run: |
+          # By package file names, which carry the versions: a wheel built
+          # here from source, or MANIFEST.txt, differs in bytes on every
+          # build without anything having changed.
+          list() { grep -E '\.(whl|deb)$' | sort; }
+          before="$(git ls-tree -r --name-only HEAD -- packaging/wheels packaging/debs | list)"
+          after="$(find packaging/wheels packaging/debs -type f | list)"
+          if [ "$before" = "$after" ] && [ -f packaging/BUILD-INFO ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "bundle unchanged: same packages and versions"
+            git checkout -- packaging/wheels packaging/debs
+            git clean -fdq -- packaging/wheels packaging/debs
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            diff <(echo "$before") <(echo "$after") | sed -n 's/^[<>] //p;' | head -60 || true
+            diff <(echo "$before") <(echo "$after") > package-changes.txt || true
+            git add -A packaging/wheels packaging/debs
+          fi
+      - name: Record the build (packaging/BUILD-INFO)
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          {
+            echo "# Offline bundle build record, written by the 'Offline install bundle'"
+            echo "# workflow when the bundle's contents change.  install.sh reports it and"
+            echo "# warns when the bundle is more than 90 days old."
+            echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "source=$GITHUB_SHA"
+            echo "wheels=$(ls packaging/wheels/*.whl | wc -l) sha256sums=$(sha256sum < packaging/wheels/SHA256SUMS | cut -c1-16)"
+            for d in packaging/debs/*/*/; do
+              t="${d#packaging/debs/}"; t="${t%/}"
+              echo "debs.${t/\//.}=$(ls "$d"*.deb | wc -l) sha256sums=$(sha256sum < "$d/SHA256SUMS" | cut -c1-16)"
+            done
+          } > packaging/BUILD-INFO
+          cat packaging/BUILD-INFO
+          git add packaging/BUILD-INFO
+      - name: "check: fail if the committed bundle is stale"
+        if: env.MODE == 'check' && steps.diff.outputs.changed == 'true'
+        run: |
+          echo "::error::the committed offline bundle differs from a fresh build (newer packages exist). Merge the latest 'Refresh offline install bundle' pull request, or run the 'Offline install bundle' workflow on a branch and merge it, then release again."
+          exit 1
+      - name: "commit: commit the bundle to this branch"
+        if: env.MODE == 'commit' && steps.diff.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A packaging/wheels packaging/debs
-          if git diff --cached --quiet; then
-            echo "bundle unchanged"
-          else
-            git commit -m "Rebuild offline install bundle" \
-                       -m "Built by ${{ github.workflow }} run ${{ github.run_id }}."
-            git push
-          fi
+          git commit -m "Rebuild offline install bundle" \
+                     -m "Built by ${{ github.workflow }} run ${{ github.run_id }}."
+          git push
+      - name: "pr: open a pull request with the refreshed bundle"
+        if: env.MODE == 'pr' && steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="bundle-refresh-$(date -u +%Y%m%d)-$GITHUB_RUN_ID"
+          git checkout -b "$branch"
+          git commit -m "Refresh offline install bundle" \
+                     -m "Weekly rebuild by ${{ github.workflow }} run ${{ github.run_id }}: newer OS or Python packages (security updates) are available."
+          git push origin "$branch"
+          # One open refresh at a time: the new one supersedes older ones.
+          for n in $(gh pr list --state open --search "head:bundle-refresh-" --json number --jq '.[].number'); do
+            gh pr close "$n" --comment "Superseded by a newer bundle refresh." || true
+          done
+          {
+            echo "The weekly rebuild found newer packages for the offline bundle."
+            echo
+            echo '```'
+            sed -e 's/^< /removed  /' -e 's/^> /added    /' -e '/^[0-9]/d' -e '/^---/d' package-changes.txt | head -60
+            echo '```'
+            echo
+            echo "Merge this before the next release: the release workflow refuses a stale bundle."
+          } > body.md
+          gh pr create --base master --head "$branch" \
+            --title "Refresh offline install bundle ($(date -u +%Y-%m-%d))" --body-file body.md

@@ -27,6 +27,23 @@ bash ./install.sh
 It detects your network interfaces, writes the MAC addresses into `config.yaml`
 for you, and can generate a systemd service, plus logging units for detailed diode activity log management.
 
+### Verifying a release
+
+Since 1.6.0, every release is signed with the project's release key, and
+`install.sh` checks that signature and every file before it installs
+anything. Check the key itself once, on a machine you trust: the
+fingerprint of `packaging/dyode-release.pub` must be
+
+```
+(release key fingerprint: published here when the key is created)
+```
+
+```bash
+gpg --show-keys --with-fingerprint packaging/dyode-release.pub
+gpgv --keyring packaging/dyode-release.gpg dyode-1.6.0.tar.gz.sig dyode-1.6.0.tar.gz
+./install.sh --verify-only      # signature, every file, and the bundle's age
+```
+
 For detailed information, including steps to make your own, take a look at the [wiki](https://github.com/nc-intezra/dyode_python3/wiki).
 You may also take a look at the [public talks](https://github.com/wavestone-cdt/dyode/tree/master/Talks) done on this project.
 

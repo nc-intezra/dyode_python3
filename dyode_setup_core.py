@@ -464,7 +464,47 @@ def wait_for_address_cmd(interface, seconds=60):
             % (seconds, interface, interface, seconds))
 
 
-def systemd_unit_text(variant, side, workdir, python_exe=None, interface=None):
+SERVICE_USER = "dyode"
+SHARE_GROUP = "dyode-share"
+
+
+def service_capabilities(side):
+    """The only privileges the service keeps, with why."""
+    if side == "in":
+        return [("CAP_NET_ADMIN", "the static ARP entry for the output box"),
+                ("CAP_NET_BIND_SERVICE", "syslog on port 514")]
+    return [("CAP_NET_BIND_SERVICE", "the Modbus server on port 502"),
+            ("CAP_NET_RAW", "binding listeners to the diode NIC (older kernels)")]
+
+
+def service_groups(variant, cfg, side):
+    """Supplementary groups the service needs on this side."""
+    groups = [SHARE_GROUP]
+    if variant == "v2":
+        groups.append("dialout")                   # the serial port
+    if side == "in" and any(p["type"] == "logs" and p.get("tail")
+                            for p in cfg.get("modules", {}).values()):
+        groups.append("adm")                       # /var/log files to follow
+    return groups
+
+
+def _unit_path(path):
+    """A path as one systemd list item: % escaped, quoted if it has spaces."""
+    path = path.replace("%", "%%")
+    return '"%s"' % path if any(c.isspace() for c in path) else path
+
+
+def systemd_unit_text(variant, side, workdir, python_exe=None, interface=None,
+                      cfg=None, run_as_root=False):
+    """The dyode-in/out.service unit.
+
+    Since 1.6.0 it runs as the unprivileged 'dyode' user, keeping only the
+    capabilities in service_capabilities(), inside a systemd sandbox that
+    lets it write only to its own folders (runtime_paths of `cfg`).  A flaw
+    in DYODE or in udpcast then no longer means root on the box.
+    run_as_root=True writes the pre-1.6.0 unit (install.sh --run-as-root).
+    """
+    cfg = cfg or {"modules": {}}
     script = "dyode_in.py" if side == "in" else "dyode_out.py"
     python_exe = python_exe or os.path.join(workdir, "venv", "bin", "python")
     reason = ("the static ARP entry" if side == "in"
@@ -475,6 +515,8 @@ def systemd_unit_text(variant, side, workdir, python_exe=None, interface=None):
         "After=network-online.target",
         "Wants=network-online.target",
     ]
+    if variant == "v1" and side == "out":
+        lines.append("After=dyode-firewall.service")
     if interface:
         lines += [
             "# Stop and restart with the diode NIC, and do not start without it.",
@@ -499,11 +541,54 @@ def systemd_unit_text(variant, side, workdir, python_exe=None, interface=None):
         # udpcast and the agents never read stdin; be explicit, because
         # udp-sender/udp-receiver change behaviour when it is a terminal.
         "StandardInput=null",
-        # Creates /var/log/dyode-transfer with the right mode before start.
+        # Creates /var/log/dyode-transfer with the right mode (and owner)
+        # before start.
         "LogsDirectory=dyode-transfer",
         "LogsDirectoryMode=0750",
-        "# root is needed for %s." % reason,
-        "User=root",
+    ]
+    if run_as_root:
+        lines += ["# root is needed for %s (install.sh --run-as-root)." % reason,
+                  "User=root"]
+    else:
+        caps = service_capabilities(side)
+        names = " ".join(c for c, _ in caps)
+        lines += [
+            "# Unprivileged since 1.6.0; install.sh creates the user and gives",
+            "# it the folders below.  --run-as-root restores the old unit.",
+            "User=%s" % SERVICE_USER,
+            "Group=%s" % SERVICE_USER,
+            "SupplementaryGroups=%s" % " ".join(service_groups(variant, cfg, side)),
+            "# Files it creates are readable by the %s group (file shares)." % SHARE_GROUP,
+            "UMask=0027",
+        ]
+        lines += ["# %s: %s" % c for c in caps]
+        lines += [
+            "AmbientCapabilities=%s" % names,
+            "CapabilityBoundingSet=%s" % names,
+            "NoNewPrivileges=yes",
+            "ProtectSystem=strict",
+        ]
+        paths = [p for _, p in common.runtime_paths(cfg, side)]
+        lines += ["ReadWritePaths=%s" % _unit_path(p) for p in paths]
+        # /home holds the default folders (/home/pi/in) and often the DYODE
+        # checkout itself: read-only there, writable only where listed.
+        in_home = any(p == d or p.startswith(d + "/")
+                      for p in paths + [workdir] for d in ("/home", "/root", "/run/user"))
+        lines += [
+            "ProtectHome=%s" % ("read-only" if in_home else "yes"),
+            "PrivateTmp=yes",
+            "PrivateDevices=%s" % ("no" if variant == "v2" else "yes"),
+            "ProtectKernelModules=yes",
+            "ProtectKernelLogs=yes",
+            "ProtectControlGroups=yes",
+            "RestrictSUIDSGID=yes",
+            "RestrictRealtime=yes",
+            "LockPersonality=yes",
+            "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK",
+            "SystemCallFilter=@system-service",
+            "SystemCallErrorNumber=EPERM",
+        ]
+    lines += [
         "",
         "[Install]",
         "WantedBy=multi-user.target",
@@ -515,6 +600,18 @@ def systemd_unit_text(variant, side, workdir, python_exe=None, interface=None):
         lines.append("WantedBy=%s" % device_unit(interface))
     lines.append("")
     return "\n".join(lines)
+
+
+def model_cfg(model):
+    """The runtime's own view of a ConfigModel (load_config of its YAML)."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(model.to_yaml_text())
+        return common.load_config(path)
+    finally:
+        os.unlink(path)
 
 
 def unit_name(side):
@@ -546,6 +643,7 @@ class Plan:
         self.install_mode = install_mode
         self.config_path = os.path.join(workdir, "config.yaml")
         self.write_unit = False
+        self.run_as_root = False
         self.unit_path = None
         self.created = []
         self.backups = []
@@ -598,7 +696,9 @@ class Plan:
             iface = (self.model.in_if if self.side == "in"
                      else self.model.out_if)
             text = systemd_unit_text(self.model.variant, self.side,
-                                     self.workdir, interface=iface)
+                                     self.workdir, interface=iface,
+                                     cfg=model_cfg(self.model),
+                                     run_as_root=self.run_as_root)
             backup = backup_and_write(self.unit_path, text)
             self.created.append(self.unit_path)
             if backup:

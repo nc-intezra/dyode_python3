@@ -271,6 +271,7 @@ def run_wizard(ui, args):
 
     plan = core.Plan(model, side, workdir, install_mode=install_mode)
     plan.unit_path = os.path.join(workdir, core.unit_name(side))
+    plan.run_as_root = args.run_as_root
     plan.write_unit = ui.confirm("Start at boot", [
         "Generate a systemd service file for this side?",
         "It restarts DYODE if it crashes and sends its logs to the journal.",
@@ -523,6 +524,34 @@ def review_and_apply(ui, plan, dry_run=False):
 # Entry point
 # ==========================================================================
 
+def write_unit(args):
+    variant = args.variant or "v1"
+    side = args.side
+    if side is None:
+        print("--write-unit needs --side in or --side out")
+        return 2
+    workdir = core.target_dir(variant, side, args.repo)
+    config = os.path.join(workdir, "config.yaml")
+    try:
+        with open(config, encoding="utf-8") as fh:
+            model = core.ConfigModel.from_yaml_text(fh.read(), variant)
+        cfg = core.model_cfg(model)
+    except (OSError, ValueError, core.common.ConfigError) as err:
+        print("Cannot read %s: %s" % (config, err))
+        return 1
+    iface = model.in_if if side == "in" else model.out_if
+    text = core.systemd_unit_text(variant, side, workdir,
+                                  interface=iface if variant == "v1" else None,
+                                  cfg=cfg, run_as_root=args.run_as_root)
+    path = os.path.join(workdir, core.unit_name(side))
+    if args.dry_run:
+        print(text, end="")
+        return 0
+    backup = core.backup_and_write(path, text)
+    print("Wrote %s%s" % (path, " (previous copy: %s)" % backup if backup else ""))
+    return 0
+
+
 def new_key(args):
     path = args.key_file or os.path.join(core.target_dir("v1", "in", args.repo),
                                          "dyode.key")
@@ -561,6 +590,13 @@ def parse_args(argv=None):
     p.add_argument("--new-key", action="store_true",
                    help="create a new message authentication key (dyode.key) "
                         "beside the v1 config.yaml and exit; copy it to the other box")
+    p.add_argument("--run-as-root", action="store_true",
+                   help="generate the pre-1.6.0 service unit that runs as root "
+                        "instead of the sandboxed 'dyode' user")
+    p.add_argument("--write-unit", action="store_true",
+                   help="(re)generate this side's systemd unit from the existing "
+                        "config.yaml without asking anything, then exit "
+                        "(needs --side)")
     p.add_argument("--key-file", metavar="FILE",
                    help="where --new-key writes the key (default: DYODE_v1_full/dyode.key)")
     p.add_argument("--all-interfaces", action="store_true",
@@ -574,6 +610,8 @@ def main(argv=None):
     args = parse_args(argv)
     if args.new_key:
         return new_key(args)
+    if args.write_unit:
+        return write_unit(args)
     use_curses = not args.plain and sys.stdin.isatty() and sys.stdout.isatty()
     if use_curses:
         try:

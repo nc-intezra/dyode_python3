@@ -42,6 +42,18 @@
 #                             Installed by default except with --side in.
 #   --firewall-only           only (re)apply the firewall rules from config.yaml
 #   --config FILE             config.yaml to use with --firewall-only
+#                             and --service-only
+#   --run-as-root             run DYODE as root, as before 1.6.0, instead of
+#                             the sandboxed 'dyode' user (no user, folders
+#                             or unit changes)
+#   --service-only            only (re)create the 'dyode' user, give it the
+#                             folders in config.yaml and regenerate the unit
+#   --allow-unsigned          install a copy without a release signature
+#                             (SHA256SUMS.sig): a git checkout or a local test
+#                             build.  Offline installs refuse one otherwise.
+#                             A signature that fails is always refused.
+#   --verify-only             check the release signature, every file, and
+#                             the bundle's age; change nothing
 #   --skip-os-packages        do not install udpcast / python venv support
 #   --no-wizard               do not start the setup wizard afterwards
 #   -y, --yes                 do not ask for confirmation
@@ -60,7 +72,7 @@ OS_RELEASE="${DYODE_OS_RELEASE:-/etc/os-release}"
 
 MODE="" VARIANT="" SIDE="" PYTHON="" WITH="" WITH_GIVEN=0
 ASSUME_YES=0 RUN_WIZARD=1 SKIP_OS=0 DRY_RUN=0
-SHARES_ONLY=0 NO_SHARES=0 NO_TUNING=0 TUNING_ONLY=0 NO_FIREWALL=0 FIREWALL_ONLY=0 FW_CONFIG="" SHARE_NFS_SPECS=() SHARE_SMB_SPECS=() SMB_PW_FILE=""
+SHARES_ONLY=0 NO_SHARES=0 NO_TUNING=0 TUNING_ONLY=0 NO_FIREWALL=0 FIREWALL_ONLY=0 FW_CONFIG="" RUN_AS_ROOT=0 SERVICE_ONLY=0 ALLOW_UNSIGNED=0 VERIFY_ONLY=0 SHARE_NFS_SPECS=() SHARE_SMB_SPECS=() SMB_PW_FILE=""
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -77,6 +89,10 @@ interactive() { [ -t 0 ] && [ -t 1 ]; }
 . "$ROOT/lib/install-tuning.sh"
 # shellcheck source=lib/install-firewall.sh
 . "$ROOT/lib/install-firewall.sh"
+# shellcheck source=lib/install-user.sh
+. "$ROOT/lib/install-user.sh"
+# shellcheck source=lib/install-verify.sh
+. "$ROOT/lib/install-verify.sh"
 
 # ---------------------------------------------------------------- arguments
 while [ $# -gt 0 ]; do
@@ -105,6 +121,10 @@ while [ $# -gt 0 ]; do
     --tuning-only) TUNING_ONLY=1 ;;
     --no-firewall) NO_FIREWALL=1 ;;
     --firewall-only) FIREWALL_ONLY=1 ;;
+    --run-as-root) RUN_AS_ROOT=1 ;;
+    --service-only) SERVICE_ONLY=1 ;;
+    --allow-unsigned) ALLOW_UNSIGNED=1 ;;
+    --verify-only) VERIFY_ONLY=1 ;;
     --config) FW_CONFIG="${2:-}"; shift ;;
     --config=*) FW_CONFIG="${1#*=}" ;;
     --skip-os-packages) SKIP_OS=1 ;;
@@ -186,6 +206,14 @@ if [ "$TUNING_ONLY" -eq 1 ]; then
   exit 0
 fi
 
+# --verify-only: check the release and stop.
+if [ "$VERIFY_ONLY" -eq 1 ]; then
+  step "checking the release"
+  verify_release "$ROOT" 1
+  bundle_age_report
+  exit 0
+fi
+
 # --firewall-only: (re)apply the diode-port firewall from config.yaml and stop.
 if [ "$FIREWALL_ONLY" -eq 1 ]; then
   [ "$NO_FIREWALL" -eq 0 ] || die "--firewall-only and --no-firewall contradict each other"
@@ -202,6 +230,27 @@ if [ "$FIREWALL_ONLY" -eq 1 ]; then
   fi
   [ -f "$FW_CFG" ] || die "no such config file: $FW_CFG"
   apply_firewall "$FW_CFG" "$FW_PY"
+  exit 0
+fi
+
+# --service-only: (re)create the service user, its folders and unit, and stop.
+if [ "$SERVICE_ONLY" -eq 1 ]; then
+  [ "$RUN_AS_ROOT" -eq 0 ] || die "--service-only and --run-as-root contradict each other"
+  [ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || [ -n "${DYODE_ETC:-}" ] ||
+    die "creating the service user needs root: run with sudo"
+  SV_VARIANT="${VARIANT:-v1}" SV_PY="${PYTHON:-python3}"
+  if [ -n "$FW_CONFIG" ]; then
+    SV_CFG="$FW_CONFIG"
+  elif [ "$SV_VARIANT" = v1 ]; then
+    SV_CFG="$ROOT/DYODE_v1_full/config.yaml"
+  else
+    [ -n "$SIDE" ] || die "--service-only on v2 needs --side in or --side out"
+    SV_CFG="$ROOT/DYODE_v2_light/$SIDE/config.yaml"
+  fi
+  [ -f "$SV_CFG" ] || die "no such config file: $SV_CFG (run the setup wizard first, or pass --config FILE)"
+  d="$(dirname "$SV_CFG")"
+  [ -x "$d/venv/bin/python" ] && SV_PY="$d/venv/bin/python"
+  setup_service_user "$SV_CFG" "$SV_PY" "$SV_VARIANT" "$SIDE"
   exit 0
 fi
 
@@ -380,6 +429,7 @@ say "  packages:     ${REQ#"$ROOT"/}  (from $([ "$MODE" = offline ] && echo "${W
 [ "$RUN_WIZARD" -eq 1 ] && say "  then:         the setup wizard"
 describe_tuning
 describe_firewall
+describe_service_user
 describe_shares
 
 if [ "$ASSUME_YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
@@ -399,6 +449,11 @@ check_sums() {                   # catch files damaged on the way across
   (cd "$dir" && sha256sum --quiet -c SHA256SUMS) ||
     die "files in ${dir#"$ROOT"/} do not match SHA256SUMS; copy the bundle again"
 }
+
+# The release signature first: everything below trusts these files.
+step "checking the release"
+verify_release "$ROOT" "$([ "$MODE" = offline ] && echo 1 || echo 0)"
+[ "$MODE" = offline ] && bundle_age_report
 
 # Offline: check the whole bundle BEFORE changing anything, so a damaged or
 # incomplete copy stops the install instead of leaving it half done.
@@ -547,6 +602,7 @@ fi
 if [ "$RUN_WIZARD" -eq 1 ]; then
   args=(--variant "$VARIANT" --install-mode "$MODE")
   [ -n "$SIDE" ] && args+=(--side "$SIDE")
+  [ "$RUN_AS_ROOT" -eq 1 ] && args+=(--run-as-root)
   if [ "$DRY_RUN" -eq 1 ]; then
     say "   would run: $VENV/bin/python dyode_setup.py ${args[*]}"
   elif interactive; then
@@ -565,6 +621,10 @@ if [ "$VARIANT" = v1 ] && [ "$DRY_RUN" -eq 0 ] && [ -f "$TARGET/config.yaml" ] &
    First box: $PY $ROOT/dyode_setup.py --new-key, then copy the key to the other box.
    Second box: copy dyode.key from the first box beside config.yaml (chmod 600)."
 fi
+
+# ---------------------------------------------------------------- service user
+# After the wizard, which writes the config.yaml naming the folders.
+setup_service_user "$TARGET/config.yaml" "$([ -x "$VENV/bin/python" ] && echo "$VENV/bin/python" || echo "$PY")" "$VARIANT" "$SIDE"
 
 # ---------------------------------------------------------------- firewall
 # After the wizard, which writes the config.yaml the rules are built from.

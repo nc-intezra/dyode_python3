@@ -94,10 +94,13 @@ class InstallScriptTests(unittest.TestCase):
         self.etc = os.path.join(self.tmp, "etc")
         self.bin = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin)
-        sysctl = os.path.join(self.bin, "sysctl")
-        with open(sysctl, "w") as fh:
-            fh.write("#!/bin/sh\nexit 0\n")
-        os.chmod(sysctl, 0o755)
+        # Stand-ins: the installer must never touch this machine's sysctl
+        # settings or accounts during a test.
+        for name in ("sysctl", "useradd", "groupadd", "usermod"):
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(path, 0o755)
         self.meminfo = os.path.join(self.tmp, "meminfo")
         with open(self.meminfo, "w") as fh:
             fh.write("MemTotal:       268435456 kB\n")      # 256 GB
@@ -116,8 +119,11 @@ class InstallScriptTests(unittest.TestCase):
                      PATH=self.bin + ":" + os.environ.get("PATH", "")))
 
     def offline_v2_out(self, *extra):
+        # --allow-unsigned: a test build has no release signature
+        # (signature checks: tests/test_signing.py).
         return self.install("--offline", "--variant", "v2", "--side", "out",
                             "--skip-os-packages", "--yes", "--no-wizard",
+                            "--allow-unsigned",
                             "--python", sys.executable, *extra)
 
     def test_offline_install_builds_a_working_venv_from_the_bundle(self):

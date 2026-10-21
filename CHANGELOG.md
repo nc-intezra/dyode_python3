@@ -3,6 +3,63 @@
 All notable changes to this fork of DYODE. Versions follow
 [semantic versioning](https://semver.org/); the version is in `VERSION`.
 
+## [1.6.0] - unreleased
+
+Least privilege and a trustworthy install bundle (D-06 to D-09 of the
+2026-10-21 audit). Builds on 1.5.0; no wire-format change.
+
+### Security
+
+- **DYODE runs as the unprivileged `dyode` user (D-06, D-07).** The
+  generated `dyode-in/out.service` keeps only the capabilities each side
+  uses (input: `CAP_NET_ADMIN` for the static ARP entry and
+  `CAP_NET_BIND_SERVICE` for syslog on 514; output: `CAP_NET_BIND_SERVICE`
+  for Modbus on 502 and `CAP_NET_RAW` for interface binding on older
+  kernels) inside a systemd sandbox: `NoNewPrivileges`, `ProtectSystem=strict`
+  with write access only to DYODE's own folders, `PrivateTmp`,
+  `PrivateDevices` (not on v2, which needs the serial port), a syscall filter
+  and restricted address families. udpcast runs inside the same sandbox, so a
+  flaw in it or in DYODE no longer means root on the box. `install.sh` creates
+  the user, gives it the folders named in `config.yaml`, and regenerates the
+  unit (replacing an installed one, with a backup). `--run-as-root` keeps the
+  old behaviour; `--service-only` reapplies it.
+- **File shares go through the `dyode-share` group.** `out/` is
+  `dyode:dyode-share` 2750 and verified files are 0640 (they were root-only
+  0600, which share users could not read). SMB accounts are added to the
+  group and shares use `force group`; NFS exports map clients to the group
+  (`all_squash,anonuid,anongid`). The input drop folder is 2770.
+- **Releases are signed with GPG (D-08).** The tarball holds `SHA256SUMS` of
+  every file and its signature `SHA256SUMS.sig`. `install.sh` checks both with
+  `gpgv` and `packaging/dyode-release.gpg` before changing anything; offline it
+  refuses an unsigned copy unless `--allow-unsigned` (git checkouts, test
+  builds), and always refuses a bad signature. `./install.sh --verify-only`
+  checks without installing. The release also carries
+  `dyode-<version>.tar.gz.sig` and the public key.
+- **The offline bundle is kept fresh (D-09).** `packaging/BUILD-INFO` records
+  when the bundle was built; `install.sh` reports it and warns after 90 days.
+  A weekly workflow rebuilds the bundle and opens a pull request when any
+  package changed, and the release workflow refuses to release a bundle that
+  a fresh build would change.
+
+### Upgrading from 1.5.0
+
+1. `sudo ./install.sh` on each box (creates the user, hands over the folders,
+   updates the installed unit), then `sudo systemctl restart dyode-out` /
+   `dyode-in`.
+2. Users of an SMB share must reconnect (new group membership). Local users
+   who drop files into `in/` need to be in `dyode-share`
+   (`sudo usermod -aG dyode-share NAME`).
+3. A `tail`ed log file must be readable by the `adm` group (the usual case for
+   `/var/log`), since the service is no longer root.
+4. From a git checkout, add `--allow-unsigned`.
+
+### For maintainers
+
+Create the release key once with `tools/release-key.sh`, commit
+`packaging/dyode-release.pub` and `.gpg`, and add the `DYODE_RELEASE_KEY`
+and `DYODE_RELEASE_KEY_PASSPHRASE` repository secrets. Releases fail
+without them.
+
 ## [1.5.0] - unreleased
 
 Security release, from the 2026-10-21 audit. **Upgrade both boxes together,

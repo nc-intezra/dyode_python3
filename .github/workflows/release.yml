@@ -11,7 +11,12 @@
 # one was pushed), runs the test suite, and verifies the offline bundle, so a
 # release is never cut from a tree whose bundle is incomplete or damaged.
 # The release carries dyode-<version>.tar.gz (the whole repository, offline
-# bundle included) and its SHA-256, for carrying across an air gap.
+# bundle included), its SHA-256, and (since 1.6.0) GPG signatures: the
+# tarball holds SHA256SUMS of every file and SHA256SUMS.sig, which
+# install.sh checks with gpgv; dyode-<version>.tar.gz.sig and
+# dyode-release.pub are attached for checking the download itself.
+# Signing needs the DYODE_RELEASE_KEY and DYODE_RELEASE_KEY_PASSPHRASE
+# secrets (tools/release-key.sh); without them the release fails.
 name: Release
 
 on:
@@ -25,9 +30,18 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write          # needed by the reused bundle workflow
 
 jobs:
+  # Rebuild the offline bundle from today's archives and fail if it differs
+  # from the committed one: a release never ships stale security updates.
+  bundle:
+    uses: ./.github/workflows/offline-bundle.yml
+    with:
+      mode: check
+
   release:
+    needs: bundle
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
@@ -69,16 +83,28 @@ jobs:
             (cd "$d" && sha256sum --quiet -c SHA256SUMS) && echo "ok  $d"
           done
 
-      - name: Package
+      - name: Package and sign
         if: steps.version.outputs.skip != 'true'
+        env:
+          DYODE_RELEASE_KEY: ${{ secrets.DYODE_RELEASE_KEY }}
+          DYODE_RELEASE_KEY_PASSPHRASE: ${{ secrets.DYODE_RELEASE_KEY_PASSPHRASE }}
         run: |
           version="$(cat VERSION)"
           name="dyode-$version"
-          git archive --format=tar.gz --prefix="$name/" -o "$name.tar.gz" HEAD
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          # SHA256SUMS of every file + its signature go into the tarball,
+          # where install.sh checks them before installing anything.
+          tools/sign_release.sh
+          # The same check a user's box will make, on the real tarball.
+          mkdir check && tar xzf "$name.tar.gz" -C check
+          (cd "check/$name" && ./install.sh --verify-only)
           # This version's CHANGELOG section becomes the release notes.
           awk -v v="[$version]" '/^## \[/ { p = index($0, v) > 0; next } p' \
             CHANGELOG.md > notes.md
+          {
+            echo
+            echo "Offline bundle built $(sed -n 's/^built=//p' packaging/BUILD-INFO)."
+            echo "Signing key: \`$(gpg --show-keys --with-colons packaging/dyode-release.pub | awk -F: '/^fpr:/ {print $10; exit}')\`"
+          } >> notes.md
           ls -l "$name".tar.gz*
 
       - name: Publish
@@ -88,4 +114,5 @@ jobs:
           # Creates tag v<version> at this commit if it does not exist yet.
           gh release create "v$version" --target "$GITHUB_SHA" \
             "dyode-$version.tar.gz" "dyode-$version.tar.gz.sha256" \
+            "dyode-$version.tar.gz.sig" packaging/dyode-release.pub \
             --title "DYODE $version" --notes-file notes.md

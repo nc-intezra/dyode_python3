@@ -545,6 +545,41 @@ def modules_of_type(cfg, mtype):
     return {n: p for n, p in cfg["modules"].items() if p["type"] == mtype}
 
 
+def runtime_paths(cfg, side):
+    """Folders the service writes to on one side, as (role, path) pairs.
+
+    Used to generate the systemd unit (ReadWritePaths=) and by install.sh to
+    create them owned by the 'dyode' user: under ProtectSystem=strict the
+    service can write nowhere else, so it cannot create them itself.
+    Roles: 'in' (input drop folder, input box), 'out' (verified files,
+    output box), 'staging' (output box), 'logs' (received logs, output box),
+    'state' (folder of a logs module's tail_state, input box).
+    """
+    found = []
+    for props in cfg.get("modules", {}).values():
+        mtype = props["type"]
+        if mtype == "folder":
+            if side == "in":
+                found.append(("in", props["in"]))
+            else:
+                out = str(props["out"]).rstrip(os.sep)
+                found.append(("out", out))
+                # Same rule as dyode.staging_dir().
+                found.append(("staging", props.get("staging") or out + ".incoming"))
+        elif mtype == "logs":
+            if side == "out" and props.get("out"):
+                found.append(("logs", props["out"]))
+            if side == "in" and props.get("tail_state"):
+                found.append(("state", os.path.dirname(props["tail_state"])))
+    seen, unique = set(), []
+    for role, path in found:
+        path = os.path.normpath(str(path))
+        if path not in seen:
+            seen.add(path)
+            unique.append((role, path))
+    return unique
+
+
 # --------------------------------------------------------------------------
 # Process supervision
 # --------------------------------------------------------------------------
@@ -799,6 +834,25 @@ class MessageAuth:
                             self.rejected - self._warned_count)
                 self._warned_at, self._warned_count = now, self.rejected
         return msg
+
+
+def interface_addresses():
+    """{interface: IPv4 address} for every interface that has one (Linux)."""
+    import fcntl
+    import struct
+    found = {}
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _, name in socket.if_nameindex():
+            try:
+                packed = fcntl.ioctl(probe.fileno(), 0x8915,       # SIOCGIFADDR
+                                     struct.pack("256s", name[:15].encode()))
+            except OSError:
+                continue
+            found[name] = socket.inet_ntoa(packed[20:24])
+    finally:
+        probe.close()
+    return found
 
 
 # --------------------------------------------------------------------------

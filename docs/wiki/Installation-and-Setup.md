@@ -20,21 +20,23 @@ On another system with Python 3.11–3.14, install `udpcast` and
 
 ```mermaid
 flowchart TB
-    REL["Download dyode-&lt;version&gt;.tar.gz<br/>and its .sha256"] --> CHECK["sha256sum -c<br/>carry across the air gap"]
+    REL["Download dyode-&lt;version&gt;.tar.gz<br/>and its .sig"] --> CHECK["gpgv (or sha256sum -c)<br/>carry across the air gap"]
     CHECK --> EXTRACT["tar xzf … on each box"]
     EXTRACT --> INSTALL["sudo ./install.sh"]
 
     subgraph INST["install.sh"]
         direction TB
         Q["Ask, or read flags:<br/>offline/online, v1/v2, side,<br/>sharing services"] --> PLAN["Show the plan, confirm"]
-        PLAN --> SUMS["Verify SHA256SUMS of the<br/>whole bundle before changing anything"]
+        PLAN --> SIG["Check the release signature (gpgv)<br/>and every file; report bundle age"]
+        SIG --> SUMS["Verify SHA256SUMS of the<br/>whole bundle before changing anything"]
         SUMS --> DEBS["OS packages: udpcast, python3-venv,<br/>optional ssh/nfs/smb<br/>(via a private local apt repo)"]
         DEBS --> VENV["Build a virtualenv on THIS machine"]
         VENV --> WHEELS["pip install --no-index<br/>from packaging/wheels"]
         WHEELS --> IMPORT["Check every package imports"]
         IMPORT --> TUNE["Receiving box: kernel settings<br/>/etc/sysctl.d/90-dyode-receive.conf"]
         TUNE --> WIZ["Setup wizard<br/>+ dyode.key"]
-        WIZ --> FWALL["Receiving box: firewall<br/>/etc/dyode/firewall.nft"]
+        WIZ --> USER["Service user 'dyode':<br/>folders, sandboxed unit"]
+        USER --> FWALL["Receiving box: firewall<br/>/etc/dyode/firewall.nft"]
         FWALL --> SHARES["Optional: file shares<br/>NFS / SMB"]
     end
 
@@ -54,6 +56,9 @@ sudo ./install.sh --with clients                    # only sftp / mount.nfs / mo
 sudo ./install.sh --shares-only --share-nfs /srv/dyode/out=10.0.2.0/24   # change shares later
 sudo ./install.sh --tuning-only                     # (re)apply receive-side kernel settings
 sudo ./install.sh --firewall-only                   # (re)apply the diode-port firewall
+sudo ./install.sh --service-only                    # (re)create the dyode user, folders and unit
+./install.sh --verify-only                          # check signature, files and bundle age
+sudo ./install.sh --offline --allow-unsigned        # from a git checkout or a test build
 sudo ./install.sh --offline --variant v1 --yes --no-wizard --no-firewall   # unattended, no firewall
 ./install.sh --dry-run                              # show what would happen
 ```
@@ -94,8 +99,11 @@ The generated `dyode-in.service` / `dyode-out.service`:
   again when it returns;
 - restarts forever (`Restart=always`, with no start limit), because a diode
   box often has nobody watching it;
-- runs as root (needed for the static ARP entry and for privileged ports)
-  and creates `/var/log/dyode-transfer`.
+- since 1.6.0 runs as the unprivileged `dyode` user in a systemd sandbox,
+  keeping only the capabilities it needs (see [Security](Security#least-privilege-160)),
+  and creates `/var/log/dyode-transfer`. `install.sh` creates the user,
+  hands it the folders in `config.yaml` and regenerates the unit;
+  `--run-as-root` keeps the old root unit.
 
 ```bash
 sudo cp DYODE_v1_full/dyode-out.service /etc/systemd/system/

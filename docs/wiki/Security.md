@@ -90,6 +90,35 @@ sudo nft list table inet dyode          # counters show what was dropped
 - **NFS exports** of a folder inside a larger filesystem use
   `subtree_check`. A dedicated filesystem for `out/` is stronger still.
 
+## Least privilege (1.6.0)
+
+The service runs as the `dyode` user, not root, in a systemd sandbox:
+
+| Setting | Value |
+|---|---|
+| Capabilities | input: `CAP_NET_ADMIN` (ARP), `CAP_NET_BIND_SERVICE` (syslog 514) · output: `CAP_NET_BIND_SERVICE` (Modbus 502), `CAP_NET_RAW` |
+| Writable | only the folders in `config.yaml` and `/var/log/dyode-transfer` |
+| Also | `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, `PrivateDevices` (v1), syscall filter, IPv4/IPv6/Unix/netlink sockets only |
+
+udpcast runs inside the same sandbox. File-share users reach `out/` through
+the `dyode-share` group.
+
+## Signed releases (1.6.0)
+
+```mermaid
+flowchart LR
+    CI["Release workflow"] -->|"SHA256SUMS of every file,<br/>signed with the release key"| TAR["dyode-x.tar.gz<br/>+ SHA256SUMS + .sig"]
+    TAR -->|"air gap"| BOX["install.sh"]
+    BOX --> G{"gpgv: signature<br/>good?"}
+    G -- no --> STOP["Stop, change nothing"]
+    G -- yes --> S{"every file matches<br/>SHA256SUMS?"}
+    S -- no --> STOP
+    S -- yes --> AGE["Report bundle age<br/>(warn over 90 days)"] --> GO["Install"]
+```
+
+Check the public key's fingerprint against the README once, on a machine
+you trust. `./install.sh --verify-only` runs the checks without installing.
+
 ## Limits
 
 - **DYODE v2 (serial) is not authenticated.** The optocoupler link is

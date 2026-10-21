@@ -938,6 +938,12 @@ class FolderReceiver:
             self._finish_if_done(batch)
             return "rejected"
 
+        # mkstemp made the blob 0600.  Verified files are readable by the
+        # dyode-share group, which is how file-share users reach them.
+        try:
+            os.chmod(blob, 0o640)
+        except OSError:
+            pass
         dest = place_file(self.out_dir, entry["path"], blob)   # atomic: same filesystem
         if dest is None:
             log.error("refused to store %r: a folder on its path is a symlink or "

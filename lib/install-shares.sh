@@ -132,14 +132,22 @@ fs_root() {
 }
 
 nfs_block() {
-  local s path clients mode opts line c check
+  local s path clients mode opts line c check gid uid
   for s in "${NFS_SHARES[@]}"; do
     IFS='|' read -r path clients mode <<<"$s"
     # A folder inside a larger filesystem is exported with subtree_check, so
     # a client cannot use a guessed file handle to reach files outside it.
     # A dedicated filesystem needs no check (and is the stronger option).
     if fs_root "$path"; then check=no_subtree_check; else check=subtree_check; fi
-    opts="$mode,sync,$check,root_squash"
+    # With the 1.6.0 service user, every client is mapped to dyode /
+    # dyode-share: the group the folders and files belong to (2750/0640).
+    # Without it, remote users would need matching numeric ids to read.
+    gid="$(share_gid 2>/dev/null)" uid="$(service_uid 2>/dev/null)"
+    if [ -n "$gid" ] && [ -n "$uid" ]; then
+      opts="$mode,sync,$check,all_squash,anonuid=$uid,anongid=$gid"
+    else
+      opts="$mode,sync,$check,root_squash"
+    fi
     line="$path "
     split_clients "$clients"
     for c in "${CLIENTS[@]}"; do line="$line $c($opts)"; done
@@ -148,11 +156,21 @@ nfs_block() {
 }
 
 smb_block() {
-  local s path user mode name
+  local s path user mode name gid
+  gid="$(share_gid 2>/dev/null)"
   for s in "${SMB_SHARES[@]}"; do
     IFS='|' read -r path user mode name <<<"$s"
     printf '[%s]\n   path = %s\n   read only = %s\n   guest ok = no\n   valid users = %s\n   browseable = yes\n' \
       "$name" "$path" "$([ "$mode" = rw ] && echo no || echo yes)" "$user"
+    # 1.6.0: files belong to the dyode-share group; dropped files stay
+    # readable by the service.
+    if [ -n "$gid" ]; then
+      if [ "$mode" = rw ]; then
+        printf '   force group = %s\n   create mask = 0660\n   directory mask = 2770\n' "$SVC_SHARE_GROUP"
+      else
+        printf '   force group = %s\n' "$SVC_SHARE_GROUP"
+      fi
+    fi
   done
 }
 
@@ -286,6 +304,15 @@ apply_shares() {
         keep) say "   SMB: $user already has an SMB password; kept" ;;
       esac
     done
+    if [ -n "$(share_gid 2>/dev/null)" ]; then
+      local s2 u2
+      for s2 in "${SMB_SHARES[@]}"; do
+        IFS='|' read -r _ u2 _ _ <<<"$s2"
+        if [ "$DRY_RUN" -eq 1 ]; then say "   would add $u2 to the $SVC_SHARE_GROUP group"
+        elif usermod -aG "$SVC_SHARE_GROUP" "$u2"; then say "   SMB: $u2 added to the $SVC_SHARE_GROUP group"
+        else warn "could not add $u2 to $SVC_SHARE_GROUP; it may not be able to read the share"; fi
+      done
+    fi
     if [ "$DRY_RUN" -eq 0 ]; then
       if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet smbd 2>/dev/null; then
         systemctl reload smbd && say "   SMB: smbd reloaded"
@@ -310,11 +337,13 @@ share_summary() {
     IFS='|' read -r path user mode name <<<"$s"
     say "  sudo mount -t cifs //$host/$name /mnt/dyode -o username=$user"
     say "  smbclient //$host/$name -U $user"
-    [ "$mode" = rw ] && say "  (read-write: $user also needs write permission on $path itself)"
+    [ "$mode" = rw ] && [ -z "$(share_gid 2>/dev/null)" ] &&
+      say "  (read-write: $user also needs write permission on $path itself)"
   done
   for s in "${NFS_SHARES[@]}"; do
     IFS='|' read -r path clients mode <<<"$s"
-    [ "$mode" = rw ] && say "  (read-write NFS maps remote root to nobody; make $path writable by the clients' users)"
+    [ "$mode" = rw ] && [ -z "$(share_gid 2>/dev/null)" ] &&
+      say "  (read-write NFS maps remote root to nobody; make $path writable by the clients' users)"
   done
   return 0
 }

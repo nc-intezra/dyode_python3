@@ -328,3 +328,28 @@ What that does and does not cover:
 - **The Modbus mirror is read-only.** A SCADA client that wrote to it now
   gets exception 01. Reads outside the configured ranges get exception 02;
   `unmapped: zero` restores the old zeros.
+
+## Least privilege and signed releases (1.6.0)
+
+- **The service is no longer root.** It runs as `dyode` and can write only
+  to the folders in `config.yaml` (`ReadWritePaths=` in the unit). If you add
+  or move a folder, rerun `sudo ./install.sh --service-only` so the folder is
+  created, handed over and added to the unit; otherwise the service logs
+  *Read-only file system* or *Permission denied* for it.
+- **Reading files as a non-root user.** Files dropped into `in/` by a local
+  user need group read for `dyode-share` (SMB and NFS shares arrange that
+  themselves). Followed log files (`tail`) need to be readable by `adm`.
+- **`install.sh` takes over the configured folders**: `chown -R` to
+  `dyode:dyode-share` and group-only permissions. It refuses system folders
+  and home directories; point modules at dedicated folders.
+- **Older kernels** (before 5.7) need `CAP_NET_RAW` for the listeners' interface
+  binding; the output unit keeps it for that reason.
+- **`--run-as-root`** restores the 1.5.0 unit if the sandbox gets in the way
+  of something unusual on your box; please report what.
+- **Signatures prove origin, not safety of the key's holder.** The public key
+  ships inside the tarball it checks. Compare its fingerprint with the one in
+  the README once, on a machine you trust, or the check proves nothing against
+  someone who replaced both.
+- **Git checkouts and local builds are unsigned**: use `--allow-unsigned`.
+- **Bundle age** is the date its packages last changed. Over 90 days,
+  `install.sh` warns: download the latest release before installing on a new box.
