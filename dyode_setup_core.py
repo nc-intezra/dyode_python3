@@ -488,6 +488,34 @@ def service_groups(variant, cfg, side):
     return groups
 
 
+def unit_write_paths(cfg, side):
+    """ReadWritePaths= entries for the unit.
+
+    Under ProtectSystem=strict every entry becomes a separate bind mount in
+    the service's namespace, and rename() refuses to cross mounts even on
+    the same disk (EXDEV, "Invalid cross-device link").  DYODE renames each
+    verified file from its staging folder into the output folder, so the two
+    must be covered by ONE entry: their common parent.  1.6.0 as first
+    written listed them separately and every received file failed.
+    """
+    paths = [p for _, p in common.runtime_paths(cfg, side)]
+    if side == "out":
+        for props in common.modules_of_type(cfg, "folder").values():
+            out = os.path.normpath(str(props["out"]))
+            staging = os.path.normpath(str(props.get("staging") or out + ".incoming"))
+            parent = os.path.commonpath([out, staging])
+            if parent in (out, staging) or parent == os.sep:
+                continue        # nested (refused by the config check) or only "/" in common
+            paths = [parent if p in (out, staging) else p for p in paths]
+    # One entry per folder, none inside another (it would be a second mount).
+    unique = []
+    for p in paths:
+        if p not in unique:
+            unique.append(p)
+    return [p for p in unique
+            if not any(q != p and p.startswith(q.rstrip(os.sep) + os.sep) for q in unique)]
+
+
 def _unit_path(path):
     """A path as one systemd list item: % escaped, quoted if it has spaces."""
     path = path.replace("%", "%%")
@@ -568,7 +596,15 @@ def systemd_unit_text(variant, side, workdir, python_exe=None, interface=None,
             "NoNewPrivileges=yes",
             "ProtectSystem=strict",
         ]
-        paths = [p for _, p in common.runtime_paths(cfg, side)]
+        paths = unit_write_paths(cfg, side)
+        if any(p not in paths for p in (q for _, q in common.runtime_paths(cfg, side))):
+            lines += [
+                "# A received file is renamed from staging into its output folder.",
+                "# rename() fails across mounts (errno 18, EXDEV), and each entry",
+                "# below is its own mount, so each output folder shares one entry",
+                "# with its staging folder: their common parent.  File permissions",
+                "# still apply there; only DYODE's own folders are writable by it.",
+            ]
         lines += ["ReadWritePaths=%s" % _unit_path(p) for p in paths]
         # /home holds the default folders (/home/pi/in) and often the DYODE
         # checkout itself: read-only there, writable only where listed.

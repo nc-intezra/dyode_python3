@@ -111,11 +111,26 @@ class UnitTests(unittest.TestCase):
         self.assertNotIn("CAP_SYS_ADMIN", self.unit() + self.unit("in"))
 
     def test_writes_only_to_its_own_folders(self):
-        d = directives(self.unit("out"))
-        self.assertEqual(d["ReadWritePaths"],
-                         [p for _, p in common.runtime_paths(self.cfg, "out")])
+        # Input box: exactly its folders.
         self.assertEqual(directives(self.unit("in"))["ReadWritePaths"],
                          [p for _, p in common.runtime_paths(self.cfg, "in")])
+        # Output box: every folder here sits in self.root, so out, staging
+        # and the logs folder collapse into that one parent.
+        self.assertEqual(directives(self.unit("out"))["ReadWritePaths"], [self.root])
+
+    def test_output_and_staging_share_one_mount(self):
+        """Each entry is its own mount, and rename() cannot cross mounts:
+        listing out and staging separately made every received file fail
+        with errno 18 (field report, Raspberry Pi pair, 1.6.0)."""
+        cfg = {"modules": {
+            "a": {"type": "folder", "port": 1, "in": "/i", "out": "/srv/dyode/out"},
+            "b": {"type": "folder", "port": 2, "in": "/i", "out": "/data/b/out",
+                  "staging": "/data/b/stage"},
+            "c": {"type": "folder", "port": 3, "in": "/i", "out": "/x", "staging": "/y"},
+            "l": {"type": "logs", "port": 4, "out": "/var/log/dyode-ot"}}}
+        self.assertEqual(core.unit_write_paths(cfg, "out"),
+                         ["/srv/dyode", "/data/b", "/x", "/y", "/var/log/dyode-ot"])
+        self.assertIn("EXDEV", core.systemd_unit_text("v1", "out", "/opt/d", cfg=cfg))
 
     def test_home_is_read_only_only_when_needed(self):
         self.assertEqual(directives(self.unit())["ProtectHome"], ["yes"])
@@ -161,6 +176,90 @@ class UnitTests(unittest.TestCase):
             errors = [l for l in res.stderr.splitlines()
                       if "dyode-%s.service" % side in l]
             self.assertEqual(errors, [], res.stderr)
+
+
+def _can_unshare():
+    if os.geteuid() != 0 or not shutil.which("unshare"):
+        return False
+    return subprocess.run(["unshare", "-m", "true"], capture_output=True).returncode == 0
+
+
+@unittest.skipUnless(_can_unshare(), "needs root and unshare (mount namespaces)")
+class UnitMountTests(unittest.TestCase):
+    """Store a received file inside a mount namespace laid out like the
+    unit's ReadWritePaths=, the way systemd runs the service."""
+
+    def store(self, entries):
+        root = tempfile.mkdtemp(prefix="dyode_ns_")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        out, staging = os.path.join(root, "out"), os.path.join(root, "out.incoming")
+        os.mkdir(out)
+        os.mkdir(staging)
+        entries = [e.replace("ROOT", root) for e in entries]
+        code = """
+import os, subprocess, sys
+root = sys.argv[1]
+subprocess.run(["mount", "--make-rprivate", "/"], check=True)
+for p in sys.argv[3:]:
+    subprocess.run(["mount", "--bind", p, p], check=True)
+sys.path.insert(0, sys.argv[2])
+import dyode
+err = dyode.check_rename(root + "/out.incoming", root + "/out")
+print("probe:", err.errno if err else "ok")
+blob = root + "/out.incoming/blob"
+open(blob, "w").write("x")
+try:
+    dyode.place_file(root + "/out", "f.txt", blob); print("stored")
+except OSError as e:
+    print("errno", e.errno)
+"""
+        res = subprocess.run(["unshare", "-m", sys.executable, "-c", code, root,
+                              _setup.V1, *entries], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout.split()
+
+    def test_separate_entries_fail_with_exdev(self):
+        self.assertEqual(self.store(["ROOT/out", "ROOT/out.incoming"]),
+                         ["probe:", "18", "errno", "18"])
+
+    def test_the_generated_entries_work(self):
+        cfg = {"modules": {"f": {"type": "folder", "port": 1, "in": "/i", "out": "ROOT/out"}}}
+        self.assertEqual(core.unit_write_paths(cfg, "out"), ["ROOT"])
+        self.assertEqual(self.store(["ROOT"]), ["probe:", "ok", "stored"])
+
+
+class CrossDeviceReportTests(unittest.TestCase):
+    """If the move still fails, the file is reported against its batch with
+    the reason and the fix, not lost to a generic error."""
+
+    def test_store_failure_is_counted_and_explained(self):
+        import errno
+        import json
+        from unittest import mock
+        tmp = tempfile.mkdtemp(prefix="dyode_xdev_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        out = os.path.join(tmp, "out")
+        os.mkdir(out)
+        src = os.path.join(tmp, "src")
+        with open(src, "wb") as fh:
+            fh.write(b"data")
+        fd = os.open(src, os.O_RDONLY)
+        manifest = dyode.build_manifest([("a.txt", src, fd)])
+        os.close(fd)
+        mpath = os.path.join(tmp, "m")
+        with open(mpath, "w") as fh:
+            json.dump(manifest, fh)
+        receiver = dyode.FolderReceiver(out, module="files")
+        receiver.handle(mpath)
+        blob = os.path.join(tmp, "blob")
+        with open(blob, "wb") as fh:
+            fh.write(b"data")
+        with mock.patch.object(dyode, "place_file",
+                               side_effect=OSError(errno.EXDEV, "Invalid cross-device link")), \
+                self.assertLogs("dyode", "ERROR") as logs:
+            self.assertEqual(receiver.handle(blob), "rejected")
+        self.assertIn("--service-only", "\n".join(logs.output))
+        self.assertFalse(os.path.exists(blob))
 
 
 @unittest.skipUnless(shutil.which("bash"), "needs bash")
@@ -227,7 +326,7 @@ class InstallServiceUserTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(os.path.join(d, p)), p)
         unit = open(os.path.join(self.repo, "DYODE_v1_full", "dyode-out.service")).read()
         self.assertIn("User=dyode", unit)
-        self.assertIn("ReadWritePaths=%s/out" % d, unit)
+        self.assertIn("ReadWritePaths=%s\n" % d, unit)      # out + staging: one mount
         self.assertIn("sudo cp", res.stdout)              # not installed yet
 
     def test_input_side_folder_is_group_writable(self):

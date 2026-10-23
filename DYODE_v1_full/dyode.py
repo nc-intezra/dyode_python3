@@ -14,6 +14,7 @@ of discarding everything that follows.
 """
 
 import collections
+import errno
 import hashlib
 import json
 import logging
@@ -669,6 +670,30 @@ def read_manifest(path, auth=None):
     return data
 
 
+CROSS_DEVICE_HINT = (
+    "the staging folder and the output folder must be on the same filesystem "
+    "AND the same mount. Under the 1.6.0 systemd unit, rerun "
+    "'sudo ./install.sh --service-only' to regenerate it; otherwise set "
+    "'staging' to a folder on the same filesystem as 'out'")
+
+
+def check_rename(staging, out_dir):
+    """Rename a probe file from staging into out_dir, as every received file
+    will be.  Returns None if that works, else the error."""
+    probe = None
+    try:
+        fd, probe = tempfile.mkstemp(dir=staging, prefix=".dyode-probe-")
+        os.close(fd)
+        dest = os.path.join(out_dir, os.path.basename(probe))
+        os.replace(probe, dest)
+        os.remove(dest)
+        return None
+    except OSError as err:
+        if probe and os.path.exists(probe):
+            os.remove(probe)
+        return err
+
+
 def place_file(out_dir, rel, blob):
     """Move blob to out_dir/rel without following any symlink, creating
     missing folders on the way.  Returns the destination path, or None if a
@@ -944,7 +969,21 @@ class FolderReceiver:
             os.chmod(blob, 0o640)
         except OSError:
             pass
-        dest = place_file(self.out_dir, entry["path"], blob)   # atomic: same filesystem
+        try:
+            dest = place_file(self.out_dir, entry["path"], blob)   # atomic: same filesystem
+        except OSError as err:
+            # The file arrived intact but cannot be stored: say so against
+            # the batch, instead of losing it to a generic error.
+            log.error("could not store %s: %s%s", entry["path"], err,
+                      "; " + CROSS_DEVICE_HINT if err.errno == errno.EXDEV else "")
+            batch.rejected += 1
+            common.log_event("file_rejected", module=self.module, per_file=True,
+                             batch=batch.id[:8], path=entry["path"],
+                             reason="cross_device" if err.errno == errno.EXDEV
+                             else "store_failed", error=str(err))
+            os.remove(blob)
+            self._finish_if_done(batch)
+            return "rejected"
         if dest is None:
             log.error("refused to store %r: a folder on its path is a symlink or "
                       "not a folder", entry["path"])
@@ -1021,6 +1060,13 @@ def run_folder_output(name, props, cfg):
             os.remove(os.path.join(staging, leftover))
         except OSError:
             pass
+
+    problem = check_rename(staging, out_dir)
+    if problem is not None:
+        log.error("module %r: received files cannot be moved from %s to %s (%s); %s",
+                  name, staging, out_dir, problem,
+                  CROSS_DEVICE_HINT if problem.errno == errno.EXDEV
+                  else "check that the service can write to both folders")
 
     transport = UdpCast(props, cfg)
     receiver = FolderReceiver(out_dir, module=name, auth=common.require_auth(cfg))

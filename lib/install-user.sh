@@ -90,6 +90,41 @@ own_folder() {
     *)        chmod -R u+rwX,go-rwx "$path" ;;
   esac
   say "   $path ($role): $SVC_USER:$group $mode"
+  ensure_reachable "$path"
+}
+
+# The service user must be able to pass through every folder above PATH.
+# Raspberry Pi OS and Debian 12 create home folders 0700, so /home/pi/out
+# (the default) or a DYODE checkout in /home/pi is out of its reach, and the
+# service fails with "Permission denied".  Grant traverse-only access (an
+# ACL entry: it can reach named paths below, not list or read the folder).
+ensure_reachable() {
+  local path="$1" dir blocked=""
+  [ "$DRY_RUN" -eq 0 ] || return 0
+  id -u "$SVC_USER" >/dev/null 2>&1 || return 0
+  runuser -u "$SVC_USER" -- test -x "$path" 2>/dev/null && return 0
+  dir="$path"
+  while [ "$dir" != / ]; do
+    dir="$(dirname "$dir")"
+    runuser -u "$SVC_USER" -- test -x "$dir" 2>/dev/null || blocked="$dir"
+  done
+  [ -n "$blocked" ] || return 0
+  # Grant from the top down: each folder needs every one above it.
+  local grant="" d
+  dir="$path"
+  while [ "$dir" != / ]; do
+    dir="$(dirname "$dir")"
+    runuser -u "$SVC_USER" -- test -x "$dir" 2>/dev/null || grant="$dir $grant"
+  done
+  if command -v setfacl >/dev/null 2>&1; then
+    for d in $grant; do
+      setfacl -m "u:$SVC_USER:--x" "$d" &&
+        say "   $d: '$SVC_USER' may pass through (ACL u:$SVC_USER:--x; it cannot list or read it)"
+    done
+  fi
+  runuser -u "$SVC_USER" -- test -x "$path" 2>/dev/null ||
+    warn "the '$SVC_USER' user cannot reach $path: a folder above it ($blocked) is closed to it.
+   Run: sudo setfacl -m u:$SVC_USER:--x $grant  (package acl), or move the folder."
 }
 
 # setup_service_user CONFIG PYTHON VARIANT SIDE
@@ -113,6 +148,9 @@ setup_service_user() {
     if [ "$role" = side ]; then side="$path"; continue; fi
     own_folder "$role" "$path"
   done <<<"$listing"
+
+  # DYODE's own folder (venv, scripts) must be reachable too.
+  ensure_reachable "$ROOT"
 
   # This side's unit, regenerated for the new user (both on a v1 box whose
   # side could not be told from its addresses).

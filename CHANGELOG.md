@@ -41,6 +41,25 @@ Least privilege and a trustworthy install bundle (D-06 to D-09 of the
   package changed, and the release workflow refuses to release a bundle that
   a fresh build would change.
 
+### Fixed during field testing
+
+- **Every received file failed with "[Errno 18] Invalid cross-device link".**
+  The sandboxed unit listed the output folder and its staging folder as
+  separate `ReadWritePaths=` entries. Each entry is its own mount, and
+  `rename()` cannot cross mounts even on one disk, so the final move from
+  staging into `out` failed and the file was discarded. The unit now gives
+  each output folder and its staging folder one entry, their common parent
+  (`/home/pi` for the defaults). Only the mount's read-only layer is lifted
+  there; file permissions still keep the service out of everything but its
+  own folders.
+- A file that arrives intact but cannot be stored is now reported against
+  its batch (`file_rejected`, reason `cross_device` or `store_failed`) with
+  the fix in the log, and the output side tests that move at start-up.
+- `install.sh` checks that the `dyode` user can reach each folder and
+  DYODE's own folder. Raspberry Pi OS and Debian 12 create home folders 0700;
+  it grants traverse-only access (`setfacl -m u:dyode:--x`, package `acl`, now
+  bundled) or says exactly what to run.
+
 ### Upgrading from 1.5.0
 
 1. `sudo ./install.sh` on each box (creates the user, hands over the folders,

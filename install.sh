@@ -390,6 +390,9 @@ if [ "$SKIP_OS" -eq 0 ]; then
   if firewall_wanted && ! command -v nft >/dev/null 2>&1; then
     PKGS+=(nftables)
   fi
+  if service_user_wanted && ! command -v setfacl >/dev/null 2>&1; then
+    PKGS+=(acl)                  # traverse-only access to /home/<user> (0700)
+  fi
   if [ -z "$PY" ]; then
     die "no Python 3.11 or newer found (supported: $SUPPORTED); install one, or pass --python"
   elif ! venv_ok "$PY"; then
