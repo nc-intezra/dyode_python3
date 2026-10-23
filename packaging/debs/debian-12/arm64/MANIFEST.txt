@@ -1,7 +1,8 @@
 debian-12 arm64 (debian:12)
-built:     2026-10-21T16:18:33Z
-requested: udpcast python3-venv nftables openssh-server openssh-sftp-server openssh-client nfs-common nfs-kernel-server samba cifs-utils smbclient
+built:     2026-10-23T01:47:32Z
+requested: udpcast python3-venv nftables acl openssh-server openssh-sftp-server openssh-client nfs-common nfs-kernel-server samba cifs-utils smbclient
 
+acl_2.3.1-3_arm64.deb
 ca-certificates_20250419~deb12u2_all.deb
 cifs-utils_2%3a7.0-2_arm64.deb
 dmsetup_2%3a1.02.185-2_arm64.deb
@@ -17,7 +18,7 @@ libdbus-1-3_1.14.10-1~deb12u1_arm64.deb
 libdevmapper1.02.1_2%3a1.02.185-2_arm64.deb
 libedit2_3.1-20221030-2_arm64.deb
 libevent-core-2.1-7_2.1.12-stable-8+deb12u1_arm64.deb
-libexpat1_2.5.0-1+deb12u4_arm64.deb
+libexpat1_2.5.0-1+deb12u5_arm64.deb
 libfido2-1_1.12.0-2+b1_arm64.deb
 libgssapi-krb5-2_1.20.1-2+deb12u5_arm64.deb
 libicu72_72.1-3+deb12u1_arm64.deb

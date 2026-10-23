@@ -1,13 +1,13 @@
 # Offline bundle build record, written by the 'Offline install bundle'
 # workflow when the bundle's contents change.  install.sh reports it and
 # warns when the bundle is more than 90 days old.
-built=2026-10-21T16:15:40Z
-run=https://github.com/nc-intezra/dyode_python3/actions/runs/39632963192
-source=23081cb49503e2f983e1faa275c0a0499e9d5a48
+built=2026-10-23T01:48:24Z
+run=https://github.com/nc-intezra/dyode_python3/actions/runs/39885953261
+source=96415200a8246a812857d9bfec12339556386868
 wheels=11 sha256sums=c99c5a4f3b4bdda7
-debs.debian-12.arm64=93 sha256sums=1ad21554037b0dee
-debs.debian-13.arm64=99 sha256sums=13215d007c0c9c25
-debs.ubuntu-24.04.amd64=89 sha256sums=528f0a70d1e82ffc
-debs.ubuntu-24.04.arm64=89 sha256sums=9759779c9b6a6e93
-debs.ubuntu-26.04.amd64=101 sha256sums=9b8604c04dcc6c3a
-debs.ubuntu-26.04.arm64=101 sha256sums=3f9b05e9ab45e9ad
+debs.debian-12.arm64=93 sha256sums=45508452fedcdbc7
+debs.debian-13.arm64=97 sha256sums=c7caa6660bd75843
+debs.ubuntu-24.04.amd64=86 sha256sums=b8689be98fd95af9
+debs.ubuntu-24.04.arm64=86 sha256sums=fe08165257953316
+debs.ubuntu-26.04.amd64=95 sha256sums=618bce895e230774
+debs.ubuntu-26.04.arm64=95 sha256sums=3baf3f2c24afeef3

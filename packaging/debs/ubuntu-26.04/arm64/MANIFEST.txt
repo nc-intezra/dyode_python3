@@ -1,7 +1,8 @@
 ubuntu-26.04 arm64 (ubuntu:26.04)
-built:     2026-10-21T16:18:35Z
-requested: udpcast python3-venv nftables openssh-server openssh-sftp-server openssh-client nfs-common nfs-kernel-server samba cifs-utils smbclient
+built:     2026-10-23T01:47:37Z
+requested: udpcast python3-venv nftables acl openssh-server openssh-sftp-server openssh-client nfs-common nfs-kernel-server samba cifs-utils smbclient
 
+acl_2.3.2-2_arm64.deb
 adduser_3.153ubuntu1_all.deb
 ca-certificates_20260816ubuntu0.26.04.1_all.deb
 cifs-utils_2%3a7.4-1ubuntu0.26.04.4_arm64.deb

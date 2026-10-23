@@ -1,7 +1,8 @@
 ubuntu-24.04 amd64 (ubuntu:24.04)
-built:     2026-10-21T16:18:34Z
-requested: udpcast python3-venv nftables openssh-server openssh-sftp-server openssh-client nfs-common nfs-kernel-server samba cifs-utils smbclient
+built:     2026-10-23T01:47:38Z
+requested: udpcast python3-venv nftables acl openssh-server openssh-sftp-server openssh-client nfs-common nfs-kernel-server samba cifs-utils smbclient
 
+acl_2.3.2-1build1.1_amd64.deb
 adduser_3.137ubuntu1_all.deb
 ca-certificates_20260816ubuntu0.24.04.1_all.deb
 cifs-utils_2%3a7.0-2ubuntu0.6_amd64.deb

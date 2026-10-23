@@ -1,7 +1,8 @@
 debian-13 arm64 (debian:13)
-built:     2026-10-21T16:18:33Z
-requested: udpcast python3-venv nftables openssh-server openssh-sftp-server openssh-client nfs-common nfs-kernel-server samba cifs-utils smbclient
+built:     2026-10-23T01:47:35Z
+requested: udpcast python3-venv nftables acl openssh-server openssh-sftp-server openssh-client nfs-common nfs-kernel-server samba cifs-utils smbclient
 
+acl_2.3.2-2+b1_arm64.deb
 adduser_3.152_all.deb
 ca-certificates_20250419+deb13u1_all.deb
 cifs-utils_2%3a7.4-1+deb13u2_arm64.deb
