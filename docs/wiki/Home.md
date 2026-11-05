@@ -74,6 +74,7 @@ supervised process.
 | Page | What it covers |
 |---|---|
 | [Architecture](Architecture) | Boxes, processes, supervision, the ARP keeper, wire framing |
+| [Data Flows](Data-Flows) | Every flow end to end, with start-up, loss handling and what each side logs |
 | [Folder Transfers](Folder-Transfers) | Step-by-step data flow of a file, batches, verification, failure handling |
 | [Modbus Mirroring](Modbus-Mirroring) | PLC polling and the mirrored Modbus server |
 | [Log Streaming](Log-Streaming) | Syslog and file tailing, gap detection, forwarding |

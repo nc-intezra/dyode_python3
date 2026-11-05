@@ -2,6 +2,7 @@
 
 - [Home](Home)
 - [Architecture](Architecture)
+- [Data Flows](Data-Flows)
 - [Security](Security)
 
 **Modules**
