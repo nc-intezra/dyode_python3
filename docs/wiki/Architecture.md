@@ -128,6 +128,9 @@ dropped whole, never delivered half-corrupted.
 optocoupler. One process owns the serial port and multiplexes all Modbus
 modules over it as tagged, newline-delimited JSON messages.
 
+For every module's flow end to end, including loss handling and what
+each side logs, see [Data Flows](Data-Flows).
+
 ## Code map
 
 | File | Role |
